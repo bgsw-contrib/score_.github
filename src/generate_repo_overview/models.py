@@ -18,7 +18,7 @@ class LockfileStatus(StrEnum):
 
 DEFAULT_CATEGORY = "Uncategorized"
 DEFAULT_SUBCATEGORY = "General"
-SNAPSHOT_SCHEMA_VERSION = 28
+SNAPSHOT_SCHEMA_VERSION = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +66,29 @@ class WorkflowSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowRefResolution:
+    """Release context for one full workflow reference, refreshed each collection."""
+
+    reference: str
+    resolved_sha: str | None = None
+    version_tag: str | None = None
+    latest_release: str | None = None
+    ahead_by: int | None = None
+    behind_by: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> WorkflowRefResolution:
+        return cls(
+            reference=cast("str", data.get("reference", "")),
+            resolved_sha=cast("str | None", data.get("resolved_sha")),
+            version_tag=cast("str | None", data.get("version_tag")),
+            latest_release=cast("str | None", data.get("latest_release")),
+            ahead_by=cast("int | None", data.get("ahead_by")),
+            behind_by=cast("int | None", data.get("behind_by")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SphinxItem:
     """A feature or module declared in the platform Sphinx documentation."""
 
@@ -110,6 +133,7 @@ class DeepContentSignals:
     has_pre_commit_config: bool = False
     has_ci: bool = False
     matched_workflow_signals: tuple[str, ...] = ()
+    workflow_refs: tuple[tuple[str, str], ...] = ()
     has_coverage_config: bool = False
     top_languages: tuple[str, ...] = ()
     bazel_deps: tuple[tuple[str, str], ...] = ()
@@ -172,6 +196,7 @@ class DeepContentSignals:
             matched_workflow_signals=normalize_string_tuple(
                 data.get("matched_workflow_signals")
             ),
+            workflow_refs=normalize_string_pairs(data.get("workflow_refs")),
             has_coverage_config=bool(data.get("has_coverage_config", False)),
             top_languages=normalize_string_tuple(data.get("top_languages")),
             bazel_deps=normalize_string_pairs(data.get("bazel_deps")),
@@ -372,6 +397,7 @@ class RepoSnapshot:
     repos: tuple[RepoEntry, ...]
     tracked_deps: tuple[TrackedDep, ...] = ()
     workflow_signals: tuple[WorkflowSignal, ...] = ()
+    workflow_ref_resolutions: tuple[WorkflowRefResolution, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RepoSnapshot:
@@ -423,6 +449,11 @@ class RepoSnapshot:
             repos=tuple(RepoEntry.from_dict(repo) for repo in typed_repos_data),
             tracked_deps=tracked_deps,
             workflow_signals=workflow_signals,
+            workflow_ref_resolutions=tuple(
+                WorkflowRefResolution.from_dict(cast("Mapping[str, Any]", item))
+                for item in (data.get("workflow_ref_resolutions") or ())
+                if isinstance(item, dict) and isinstance(item.get("reference"), str)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -433,6 +464,9 @@ class RepoSnapshot:
             "repos": [repo.to_dict() for repo in self.repos],
             "tracked_deps": [dep.to_dict() for dep in self.tracked_deps],
             "workflow_signals": [s.to_dict() for s in self.workflow_signals],
+            "workflow_ref_resolutions": [
+                asdict(r) for r in self.workflow_ref_resolutions
+            ],
         }
 
 

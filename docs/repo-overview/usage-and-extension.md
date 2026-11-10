@@ -60,6 +60,49 @@ repository.
 Use `--config /path/to/file.toml` with `render-overview` to select another
 profile configuration.
 
+### Tracked Workflows
+
+Configure one `[[signals.workflow_signals]]` entry per reusable workflow:
+
+```toml
+[[signals.workflow_signals]]
+label = "Daily"
+reference = "eclipse-score/cicd-workflows/.github/workflows/daily.yml@"
+```
+
+The **Workflows** tab appears only when at least one workflow is configured.
+Each column shows the distinct tags, branches, or commit pins used by a repository,
+linked to the reusable workflow source. Full commit hashes are shortened for display;
+the full reference remains available on hover. Multiple pins are shown together,
+and `—` means the repository does not call that workflow.
+
+Collection parses job-level `uses` entries in `.github/workflows/*.yml` and
+`*.yaml`. Comments, shell snippets, step-level actions, and calls nested inside
+external workflows do not count as direct adoption. Invalid YAML files are skipped.
+Keep the trailing `@` in the configured prefix to match any version of one workflow.
+Workflow pins also appear on repository detail pages.
+
+During collection, pins are resolved against tags in the workflow source
+repository. An exact version tag replaces the abbreviated hash in the display;
+the link still targets the original pin, which remains visible on hover.
+Workflow-specific tags such as `on-pr/v1.2.3` take precedence over global version
+tags at the same commit; tags for other workflows are ignored. Version tags use
+green labels. A tag at the latest release omits the redundant comparison;
+older tags keep their comparison. Workflow-specific tags such as `on-pr/v0.0.0`
+are not compared with releases from a different tag series, such as `v0.0.3`.
+
+Next to each pin, `vs <release>` compares it with the latest published release
+of the **workflow source repository**. As in the Versions tab, `↑N` means the
+pin is N commits ahead, `↓N` means it is N commits behind, and `=` means both
+point to the same commit. Diverged histories show both arrows. `?` means the
+comparison was unavailable. Without a published release, only the pin or its
+matching version tag is shown; unresolved pins retain their original display.
+
+Source tags, releases, and branch pins are refreshed on every collection,
+including when consumer repositories reuse cached content. Each source
+repository and distinct pin is queried once per collection, so consumers
+sharing pins do not multiply the API requests. Rendering remains offline.
+
 ## Cache Controls
 
 `collect` reuses deep repository signals while the default-branch SHA is
