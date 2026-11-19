@@ -212,6 +212,7 @@ def test_fetch_repositories_reuses_cached_content_signals() -> None:
                     codeowners=("@infra-team",),
                     has_lint_config=True,
                     has_ci=True,
+                    has_dependabot_config=False,
                     matched_workflow_signals=("Daily Workflow",),
                     has_coverage_config=False,
                 ),
@@ -691,8 +692,10 @@ def test_collect_repository_entry_does_not_reuse_cached_registry_when_metadata_m
     assert entry.registry == RegistrySignals()
 
 
-def test_collect_repository_entry_refreshes_stale_volatile_metrics_without_tree_fetch(
+@pytest.mark.parametrize("legacy_snapshot", [False, True], ids=["expired", "legacy"])
+def test_collect_repository_entry_refreshes_volatile_metrics_with_cached_content(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_snapshot: bool,
 ) -> None:
     class FixedDatetime(datetime):
         @classmethod
@@ -757,6 +760,7 @@ def test_collect_repository_entry_refreshes_stale_volatile_metrics_without_tree_
             codeowners=("@infra-team",),
             has_lint_config=True,
             has_ci=True,
+            has_dependabot_config=False,
             matched_workflow_signals=("Daily Workflow",),
             has_coverage_config=False,
         ),
@@ -772,6 +776,16 @@ def test_collect_repository_entry_refreshes_stale_volatile_metrics_without_tree_
         ),
     )
 
+    if legacy_snapshot:
+        # The timestamp is fresh, but the snapshot predates the PR counters.
+        cached_data = cached_entry.to_dict()
+        cached_data["volatile"]["volatile_metrics_fetched_at"] = FixedDatetime.now(
+            UTC
+        ).isoformat()
+        cached_data["volatile"].pop("open_renovate_prs")
+        cached_data["volatile"].pop("open_dependabot_prs")
+        cached_entry = RepoEntry.from_dict(cached_data)
+
     entry = repo_entry.collect_repository_entry(
         repository_name="tools",
         repository=repo,
@@ -785,33 +799,102 @@ def test_collect_repository_entry_refreshes_stale_volatile_metrics_without_tree_
     assert entry.volatile.open_prs == 2
     assert entry.volatile.open_ready_prs == 1
     assert entry.volatile.open_draft_prs == 1
+    assert entry.volatile.open_renovate_prs == 0
+    assert entry.volatile.open_dependabot_prs == 0
     assert entry.volatile.open_issues == 4
     assert entry.volatile.latest_release_version == "v1.0.0"
     assert entry.volatile.commits_since_latest_release == 4
     assert entry.volatile.volatile_metrics_fetched_at == "2026-04-17T12:00:00+00:00"
 
 
-def test_get_open_pull_request_counts_splits_ready_and_draft() -> None:
+def test_get_open_pull_request_counts_splits_ready_draft_and_bot_authors() -> None:
     repository = SimpleNamespace(
         get_pulls=lambda state="open": [
-            SimpleNamespace(draft=False),
-            SimpleNamespace(raw_data={"draft": True}),
-            SimpleNamespace(draft=False),
+            SimpleNamespace(draft=False, user=SimpleNamespace(login="renovate[bot]")),
+            SimpleNamespace(
+                raw_data={"draft": True}, user=SimpleNamespace(login="dependabot[bot]")
+            ),
+            SimpleNamespace(
+                draft=False,
+                user=SimpleNamespace(login="eclipse-score-bot"),
+                labels=[SimpleNamespace(name="renovate")],
+            ),
+            SimpleNamespace(
+                draft=False,
+                user=SimpleNamespace(login="eclipse-score-bot"),
+                labels=[SimpleNamespace(name="automation")],
+            ),
+            SimpleNamespace(
+                draft=False,
+                user=SimpleNamespace(login="contributor"),
+                labels=[SimpleNamespace(name="renovate")],
+            ),
         ]
     )
 
     assert repo_entry.get_open_pull_request_counts(repository) == {
-        "ready": 2,
+        "ready": 4,
         "draft": 1,
-        "total": 3,
+        "total": 5,
+        "renovate": 2,
+        "dependabot": 1,
     }
     assert (
         repo_entry.get_open_issue_count(
-            SimpleNamespace(open_issues_count=5),
-            open_pull_request_total=3,
+            SimpleNamespace(open_issues_count=7),
+            open_pull_request_total=5,
         )
         == 2
     )
+
+
+def test_unavailable_bot_counts_do_not_invalidate_snapshot_timestamp() -> None:
+    fetched_at = "2026-04-17T12:00:00+00:00"
+    volatile = VolatileMetricsSnapshot.from_dict(
+        {
+            "volatile_metrics_fetched_at": fetched_at,
+            "open_renovate_prs": None,
+            "open_dependabot_prs": None,
+        }
+    )
+
+    assert volatile.volatile_metrics_fetched_at == fetched_at
+
+
+@pytest.mark.parametrize("suffix", ["yml", "yaml"])
+def test_cached_repository_backfills_dependabot_config_from_checkout(
+    tmp_path: Path, suffix: str
+) -> None:
+    config = tmp_path / ".github" / f"dependabot.{suffix}"
+    config.parent.mkdir()
+    config.write_text("version: 2\n", encoding="utf-8")
+    cached_entry = RepoEntry(
+        name="tools",
+        description="Tooling",
+        category="Infrastructure",
+        subcategory="Tooling",
+        default_branch="main",
+        default_branch_sha="abc123",
+        volatile=VolatileMetricsSnapshot(
+            volatile_metrics_fetched_at=datetime.now(UTC).isoformat()
+        ),
+    )
+
+    entry = repo_entry.maybe_collect_repository_entry_fast_path(
+        repository_name="tools",
+        repository=SimpleNamespace(),
+        custom_properties={},
+        bazel_registry_metadata=None,
+        referenced_by_reference_integration=False,
+        cached_entry=cached_entry,
+        default_branch="main",
+        default_branch_sha="abc123",
+        checkout_path=tmp_path,
+    )
+
+    assert entry is not None
+    assert entry.content.has_dependabot_config is True
+    assert entry.volatile == cached_entry.volatile
 
 
 def test_get_merged_pull_request_count_last_30_days_filters_by_branch_and_window(
