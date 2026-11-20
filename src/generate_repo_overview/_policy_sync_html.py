@@ -198,9 +198,7 @@ def _policy_header(
     description = definition.description if definition else ""
     if not description:
         return f"<th>{e(policy)}</th>"
-    return (
-        f'<th data-tooltip="{e(description)}" title="{e(description)}">{e(policy)}</th>'
-    )
+    return f'<th title="{e(description)}">{e(policy)}</th>'
 
 
 def _policy_stat(value: int, label: str, status_class: str, marker: str) -> str:
@@ -258,7 +256,7 @@ def _matrix_cell_html(outcome: PolicySyncOutcome | None) -> str:
         return '<td><span class="policy-status not-applicable" aria-label="Not applicable">N/A</span></td>'
     tooltip = _outcome_tooltip(outcome)
     return (
-        f'<td class="policy-matrix-cell" data-tooltip="{e(tooltip)}" '
+        f'<td class="policy-matrix-cell" '
         f'title="{e(tooltip)}" tabindex="0">{_matrix_cell(outcome)}</td>'
     )
 
@@ -276,7 +274,7 @@ def _matrix_cell(outcome: PolicySyncOutcome | None) -> str:
         if link:
             return _policy_pr_badge(outcome.policy_pr_status, href=link)
     content = (
-        f'<span class="policy-status {status_class}" title="{e(label)}" '
+        f'<span class="policy-status {status_class}" '
         f'aria-label="{e(label)}">{marker}</span>'
     )
     if outcome.pull_request_url and not automated:
@@ -311,7 +309,6 @@ def _policy_pr_badge(state: str | None, *, href: str | None = None) -> str:
     return (
         f'<a href="{href}" class="policy-pr-badge policy-pr-{state_class}" '
         f'aria-label="{e(label)} policy pull request" '
-        f'title="View {e(label)} policy pull request" '
         f'target="_blank" rel="noopener">{badge_content}</a>'
     )
 
