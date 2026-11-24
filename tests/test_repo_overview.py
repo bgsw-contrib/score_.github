@@ -23,6 +23,8 @@ from generate_repo_overview.metrics_report import render_metrics_report
 from generate_repo_overview.models import (
     SNAPSHOT_SCHEMA_VERSION,
     DeepContentSignals,
+    DependencyDeclaration,
+    DependencyResolution,
     GroupingLevel,
     RegistrySignals,
     RepoEntry,
@@ -476,7 +478,7 @@ def test_collect_repository_entry_reuses_cached_details_when_unchanged() -> None
             has_ci=True,
             matched_workflow_signals=("Daily Workflow",),
             has_coverage_config=True,
-            bazel_deps=(("score_docs_as_code", "1.2.3"),),
+            bazel_deps=(DependencyDeclaration("score_docs_as_code", "1.2.3"),),
         ),
         registry=RegistrySignals(
             maintainers_in_bazel_registry=("Old Maintainer",),
@@ -533,7 +535,7 @@ def test_collect_repository_entry_reuses_cached_details_when_unchanged() -> None
             has_ci=True,
             matched_workflow_signals=("Daily Workflow",),
             has_coverage_config=True,
-            bazel_deps=(("score_docs_as_code", "1.2.3"),),
+            bazel_deps=(DependencyDeclaration("score_docs_as_code", "1.2.3"),),
         ),
         registry=RegistrySignals(
             maintainers_in_bazel_registry=("New Maintainer",),
@@ -1052,28 +1054,11 @@ def test_detect_bazel_version_ignores_module_version_without_dot_bazelversion() 
     )
 
 
-def test_get_all_bazel_dep_versions_extracts_dependency_versions() -> None:
-    assert signal_detection.get_all_bazel_dep_versions(
-        'bazel_dep(name = "score_docs_as_code", version = "4.0.0")\n'
-        'bazel_dep(name = "score_process", version = "1.2.3")\n',
-    ) == (("score_docs_as_code", "4.0.0"), ("score_process", "1.2.3"))
-
-
-def test_get_all_bazel_dep_versions_detects_versionless_deps() -> None:
-    assert signal_detection.get_all_bazel_dep_versions(
-        'bazel_dep(name = "some_lib", dev_dependency = True)\n'
-        'bazel_dep(name = "score_process", version = "1.2.3")\n',
-    ) == (("score_process", "1.2.3"), ("some_lib", "unversioned"))
-
-
-def test_get_all_bazel_dep_versions_returns_empty_for_no_deps() -> None:
-    assert signal_detection.get_all_bazel_dep_versions("# no deps\n") == ()
-
-
 def test_get_bazel_module_name_extracts_root_module_name() -> None:
     assert (
         signal_detection.get_bazel_module_name(
-            'module(\n    name = "score_logging",\n    version = "1.0.0",\n)\n'
+            '# module(name = "example")\n'
+            "module(\n    name = 'score_logging',\n    version = '1.0.0',\n)\n"
             'bazel_dep(name = "score_tooling", version = "2.0.0")\n'
         )
         == "score_logging"
@@ -1152,42 +1137,6 @@ def test_detect_repo_sphinx_items_reads_feature_architecture() -> None:
             identifier="mod__logging_repo",
         ),
     )
-
-
-def test_reference_integration_reads_recursive_included_module_files(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "MODULE.bazel").write_text(
-        """
-bazel_dep(name = "score_root")
-include("//bazel_common:deps.MODULE.bazel")
-""".strip(),
-        encoding="utf-8",
-    )
-    bazel_common = tmp_path / "bazel_common"
-    bazel_common.mkdir()
-    (bazel_common / "deps.MODULE.bazel").write_text(
-        """
-bazel_dep(name = "score_tooling")
-include(":nested.MODULE.bazel")
-""".strip(),
-        encoding="utf-8",
-    )
-    (bazel_common / "nested.MODULE.bazel").write_text(
-        'bazel_dep(name = "score_logging")\n',
-        encoding="utf-8",
-    )
-
-    contents = reference_integration.read_included_module_files(tmp_path)
-
-    assert set(contents) == {
-        Path("MODULE.bazel"),
-        Path("bazel_common/deps.MODULE.bazel"),
-        Path("bazel_common/nested.MODULE.bazel"),
-    }
-    assert reference_integration.get_bazel_dep_names_from_contents(
-        contents.values()
-    ) == ("score_root", "score_tooling", "score_logging")
 
 
 @pytest.mark.parametrize(
@@ -1377,7 +1326,7 @@ def test_latest_release_details_keep_divergence_from_single_comparison(
         repo_entry, "detect_bazel_version", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(
-        repo_entry, "detect_all_bazel_deps", lambda *_args, **_kwargs: ()
+        repo_entry, "detect_bazel_dependencies", lambda *_args, **_kwargs: ()
     )
     repository = Repository()
 
@@ -1509,12 +1458,12 @@ def test_reference_integration_maps_bazel_registry_modules_to_repositories(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        reference_integration,
+        registry_metadata,
         "default_cache_directory",
         lambda: tmp_path,
     )
 
-    assert reference_integration.get_bazel_registry_repositories_by_module(
+    assert registry_metadata.get_bazel_registry_repositories_by_module(
         active_repository_names={"process_description"},
         registry_repository=registry_repository,
     ) == {"score_process": "process_description"}
@@ -1537,13 +1486,13 @@ def test_reference_integration_ignores_unsafe_registry_repository_path(
     expected_repositories: dict[str, str],
 ) -> None:
     monkeypatch.setattr(
-        reference_integration,
+        registry_metadata,
         "default_cache_directory",
         lambda: tmp_path / "cache",
     )
 
     assert (
-        reference_integration.get_bazel_registry_repositories_by_module(
+        registry_metadata.get_bazel_registry_repositories_by_module(
             active_repository_names={"process_description"},
             registry_repository=registry_repository,
         )
@@ -2182,7 +2131,7 @@ def test_metrics_report_renders_versions_table() -> None:
                 content=DeepContentSignals(
                     is_bazel_repo=True,
                     bazel_version="8.4.2",
-                    bazel_deps=(("score_docs_as_code", "4.0.0"),),
+                    bazel_deps=(DependencyDeclaration("score_docs_as_code", "4.0.0"),),
                     referenced_by_reference_integration=True,
                     has_ci=True,
                     matched_workflow_signals=("Daily Workflow",),
@@ -2218,6 +2167,17 @@ def test_versions_table_tracked_dep_color_rules() -> None:
                 repo="eclipse-score/docs-as-code", module_name="score_docs_as_code"
             ),
         ),
+        dependency_resolutions=tuple(
+            DependencyResolution(
+                "eclipse-score/docs-as-code",
+                version,
+                latest_release="4.1.3",
+                registry_update_available=update_available,
+                consumer_org="eclipse-score",
+                module="score_docs_as_code",
+            )
+            for version, update_available in (("4.1.3", False), ("4.1.1", True))
+        ),
         repos=(
             RepoEntry(
                 name="docs-as-code",
@@ -2233,7 +2193,7 @@ def test_versions_table_tracked_dep_color_rules() -> None:
                 category="Infrastructure",
                 subcategory="Tooling",
                 content=DeepContentSignals(
-                    bazel_deps=(("score_docs_as_code", "4.1.3"),),
+                    bazel_deps=(DependencyDeclaration("score_docs_as_code", "4.1.3"),),
                     bazel_version="8.5.0",
                 ),
             ),
@@ -2243,7 +2203,7 @@ def test_versions_table_tracked_dep_color_rules() -> None:
                 category="Infrastructure",
                 subcategory="Tooling",
                 content=DeepContentSignals(
-                    bazel_deps=(("score_docs_as_code", "4.1.1"),),
+                    bazel_deps=(DependencyDeclaration("score_docs_as_code", "4.1.1"),),
                     bazel_version="8.4.0",
                 ),
             ),
@@ -2253,7 +2213,7 @@ def test_versions_table_tracked_dep_color_rules() -> None:
                 category="Infrastructure",
                 subcategory="Tooling",
                 content=DeepContentSignals(
-                    bazel_deps=(("score_docs_as_code", "3.9.9"),),
+                    bazel_deps=(DependencyDeclaration("score_docs_as_code", "3.9.9"),),
                     bazel_version="8.3.0",
                 ),
             ),
@@ -2284,7 +2244,7 @@ def test_versions_table_tracked_dep_color_rules() -> None:
         in markdown
     )
     assert (
-        "| [older](https://github.com/eclipse-score/older) | 🔴 8.3.0 | 🔴 3.9.9 | no |"
+        "| [older](https://github.com/eclipse-score/older) | 🔴 8.3.0 | ⚪ 3.9.9 | no |"
         in markdown
     )
     assert (
@@ -2303,6 +2263,24 @@ def test_versions_table_multiple_tracked_deps() -> None:
                 repo="eclipse-score/docs-as-code", module_name="score_docs_as_code"
             ),
             TrackedDep(repo="eclipse-score/toolchain", module_name="score_toolchain"),
+        ),
+        dependency_resolutions=(
+            DependencyResolution(
+                "eclipse-score/docs-as-code",
+                "4.1.3",
+                latest_release="4.1.3",
+                registry_update_available=False,
+                consumer_org="eclipse-score",
+                module="score_docs_as_code",
+            ),
+            DependencyResolution(
+                "eclipse-score/toolchain",
+                "1.9.0",
+                latest_release="2.0.0",
+                registry_update_available=True,
+                consumer_org="eclipse-score",
+                module="score_toolchain",
+            ),
         ),
         repos=(
             RepoEntry(
@@ -2329,8 +2307,8 @@ def test_versions_table_multiple_tracked_deps() -> None:
                 content=DeepContentSignals(
                     bazel_version="8.6.0",
                     bazel_deps=(
-                        ("score_docs_as_code", "4.1.3"),
-                        ("score_toolchain", "1.9.0"),
+                        DependencyDeclaration("score_docs_as_code", "4.1.3"),
+                        DependencyDeclaration("score_toolchain", "1.9.0"),
                     ),
                 ),
             ),
@@ -2341,7 +2319,7 @@ def test_versions_table_multiple_tracked_deps() -> None:
 
     assert "Docs As Code Version" in markdown
     assert "Toolchain Version" in markdown
-    assert "🟢 4.1.3 | 🔴 1.9.0" in markdown
+    assert "🟢 4.1.3 | 🟡 1.9.0" in markdown
 
 
 def test_metrics_report_renders_without_tracked_deps_or_signals() -> None:

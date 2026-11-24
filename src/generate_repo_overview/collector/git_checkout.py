@@ -75,14 +75,16 @@ def fetch_repository_ref(
     *,
     github_token: str | None,
 ) -> str | None:
+    # A depth-limited fetch can make a history checkout shallow again.
+    # Only limit depth for checkouts that are already shallow.
+    shallow = git_output(checkout_path, "rev-parse", "--is-shallow-repository")
     if not run_git_command(
         [
             "git",
             "-C",
             str(checkout_path),
             "fetch",
-            "--depth",
-            "1",
+            *(["--depth", "1"] if shallow == "true" else []),
             "--no-tags",
             "origin",
             ref,
@@ -106,6 +108,13 @@ def list_repository_paths(checkout_path: Path) -> set[str]:
     return {path for path in output.split("\0") if path}
 
 
+def list_repository_paths_at_ref(checkout_path: Path, ref: str) -> set[str]:
+    output = _run_git_for_text(
+        ["git", "-C", str(checkout_path), "ls-tree", "-r", "--name-only", "-z", ref]
+    )
+    return {path for path in (output or "").split("\0") if path}
+
+
 def read_repository_text(checkout_path: Path, path: str) -> str | None:
     try:
         return (checkout_path / path).read_text(encoding="utf-8", errors="replace")
@@ -119,6 +128,11 @@ def read_repository_text_at_ref(
     path: str,
 ) -> str | None:
     return _run_git_for_text(["git", "-C", str(checkout_path), "show", f"{ref}:{path}"])
+
+
+def git_output(repository_path: Path, *args: str) -> str | None:
+    """Return a local Git command's stripped output, or ``None`` if it fails."""
+    return _run_git_for_text(["git", "-C", str(repository_path), *args])
 
 
 def run_git_command(

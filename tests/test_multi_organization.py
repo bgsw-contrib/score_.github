@@ -8,16 +8,12 @@ import pytest
 import generate_repo_overview.cli as cli
 import generate_repo_overview.collector as collector
 from generate_repo_overview.metrics_html import render_all_pages
-from generate_repo_overview.metrics_report import (
-    get_latest_tracked_dep_version,
-    render_metrics_report,
-)
+from generate_repo_overview.metrics_report import render_metrics_report
 from generate_repo_overview.models import (
     SNAPSHOT_SCHEMA_VERSION,
     DeepContentSignals,
     RepoEntry,
     RepoSnapshot,
-    TrackedDep,
     VolatileMetricsSnapshot,
 )
 from generate_repo_overview.org_config import load_org_config
@@ -130,9 +126,6 @@ reference_integration_repo = ""
     assert 'href="../../../index.html"' in secondary
     assert "&rsaquo; second-org/shared" in secondary
     assert 'src="../../../bazel_logo.svg"' in secondary
-
-    tracked_dep = TrackedDep(repo="second-org/shared", module_name="shared")
-    assert get_latest_tracked_dep_version(list(snapshot.repos), tracked_dep) == "2.0.0"
 
 
 @pytest.mark.parametrize(
@@ -272,33 +265,47 @@ repository_owner = "second-org"
     assert "policy-status changes-required" in policy_rows[0]
 
 
-def test_schema_30_single_org_snapshot_can_be_read_and_written_as_schema_31() -> None:
-    snapshot = RepoSnapshot.from_dict(
-        {
-            "schema_version": 30,
-            "org_name": "first-org",
-            "generated_at": "2026-01-01T00:00:00+00:00",
-            "repos": [
-                {"name": "tools", "volatile": {"latest_release_version": "v1.2.3"}}
-            ],
-        }
+@pytest.mark.parametrize("schema_version", [30, 31, 32, 33, 34])
+def test_older_snapshot_renders_but_is_not_reused_for_collection(
+    schema_version: int, tmp_path: Path
+) -> None:
+    cache = tmp_path / "snapshot.json"
+    repo = {
+        "name": "tools",
+        "content": {"bazel_deps": [["rules_python", "1.2.3"]]},
+        "volatile": {"latest_release_version": "v1.2.3"},
+    }
+    source_repo = {
+        "name": "rules_python",
+        "content": {"bazel_module_name": "rules_python"},
+    }
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "org_name": "first-org",
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "repos": [
+                    item if schema_version == 30 else dict(item, owner="first-org")
+                    for item in (repo, source_repo)
+                ],
+            }
+        )
     )
+    snapshot = collector.load_snapshot(cache)
     assert snapshot.organization_names == ("first-org",)
-    assert snapshot.to_dict()["schema_version"] == 31
+    assert snapshot.to_dict()["schema_version"] == SNAPSHOT_SCHEMA_VERSION
     assert snapshot.repos[0].full_name == "first-org/tools"
-    repos = list(snapshot.repos)
-    assert (
-        get_latest_tracked_dep_version(repos, TrackedDep("first-org/tools", "tools"))
-        == "1.2.3"
-    )
-    assert (
-        get_latest_tracked_dep_version(repos, TrackedDep("second-org/tools", "tools"))
-        is None
-    )
-    assert (
-        'href="https://github.com/first-org/tools"'
-        in render_all_pages(snapshot)["tools/index.html"]
-    )
+    assert snapshot.repos[0].volatile.latest_release_version == "v1.2.3"
+    page = render_all_pages(snapshot)["tools/index.html"]
+    assert 'href="https://github.com/first-org/tools"' in page
+    assert "rules_python" in page
+    source_page = render_all_pages(snapshot)["rules_python/index.html"]
+    assert "Consumer data unavailable" in source_page
+    assert "No direct dependency on this repository was found." not in source_page
+    assert not RepoSnapshot.from_dict(snapshot.to_dict()).dependency_sources_available
+    # The cached module files need to be parsed again for registry overrides.
+    assert collector.load_snapshot_if_present(cache) is None
 
 
 def test_markdown_qualifies_secondary_repository_names_in_each_table() -> None:

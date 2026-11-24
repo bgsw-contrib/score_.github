@@ -78,14 +78,10 @@ def render_versions_section(
     repos: list[RepoEntry], *, snapshot: RepoSnapshot
 ) -> list[str]:
     """Render the Versions table with one column per tracked dep plus Bazel and Ref-Int."""
-    from .models import lookup_bazel_dep_version
+    from .models import lookup_bazel_dependency
 
     tracked_deps = snapshot.tracked_deps
     max_bazel_version = get_max_bazel_version(repos)
-    latest_dep_versions = {
-        dep.module_name: get_latest_tracked_dep_version(repos, dep)
-        for dep in tracked_deps
-    }
 
     dep_labels = [tracked_dep_label(dep) for dep in tracked_deps]
 
@@ -93,13 +89,23 @@ def render_versions_section(
         bazel_cell = render_bazel_version_status(
             entry.content.bazel_version, max_bazel_version
         )
-        dep_cells = " | ".join(
-            render_dep_version_status(
-                lookup_bazel_dep_version(entry.content.bazel_deps, dep.module_name),
-                latest_dep_versions.get(dep.module_name),
+        dependency_cells: list[str] = []
+        for dep in tracked_deps:
+            declaration = lookup_bazel_dependency(
+                entry.content.bazel_deps, dep.module_name
             )
-            for dep in tracked_deps
-        )
+            resolution = (
+                snapshot.dependency_resolution(entry, declaration)
+                if declaration is not None
+                else None
+            )
+            dependency_cells.append(
+                render_dep_version_status(
+                    declaration.display_version if declaration else None,
+                    resolution.release_update_available if resolution else None,
+                )
+            )
+        dep_cells = " | ".join(dependency_cells)
         refint = render_bool(entry.content.referenced_by_reference_integration)
         parts = f"| {render_repository_link(entry, org_name)} | {bazel_cell} |"
         if dep_cells:
@@ -123,9 +129,9 @@ def render_versions_section(
         "- `Reference Integration`: `yes` when the repository is a direct `bazel_dep(...)` in the reference integration's root `MODULE.bazel` or included module files.",
         "- `Bazel Version`: highest version in the table is `🟢`; every other value is `🔴`.",
     ]
-    for label in dep_labels:
+    if tracked_deps:
         lines.append(
-            f"- `{label} Version`: `⚪` if missing, `🟢` if equal to latest release, `🟡` if same major.minor, else `🔴`."
+            "- Tracked dependencies show declared pins. 🟢 means up to date, 🟡 means an update is available, and ⚪ means unavailable."
         )
     lines.append("")
     lines.extend(
@@ -382,16 +388,6 @@ def get_max_bazel_version(repos: list[RepoEntry]) -> tuple[int, ...] | None:
     return max(keys) if keys else None
 
 
-def get_latest_tracked_dep_version(
-    repos: list[RepoEntry], dep: TrackedDep
-) -> str | None:
-    for repo in repos:
-        if repo.matches_repository(dep.repo):
-            v = repo.volatile.latest_release_version
-            return v.removeprefix("v").strip() if v else None
-    return None
-
-
 def tracked_dep_label(dep: TrackedDep) -> str:
     return dep.repo.rsplit("/", 1)[-1].replace("-", " ").replace("_", " ").title()
 
@@ -414,34 +410,14 @@ def render_bazel_version_status(
     return f"🔴 {escape_markdown_table_cell(cleaned)}"
 
 
-def major_minor(version: str) -> tuple[int, int] | None:
-    parsed = parse_version_key(version)
-    if parsed is None or len(parsed) < 2:
-        return None
-    return (parsed[0], parsed[1])
-
-
 def render_dep_version_status(
     dep_version: str | None,
-    latest_version: str | None,
+    update_available: bool | None,
 ) -> str:
-    if dep_version is None or not dep_version.strip():
+    if dep_version is None:
         return "⚪ -"
-
-    cleaned = dep_version.strip()
-    if latest_version is None:
-        return f"⚪ {escape_markdown_table_cell(cleaned)}"
-
-    latest_cleaned = latest_version.strip()
-    if cleaned == latest_cleaned:
-        return f"🟢 {escape_markdown_table_cell(cleaned)}"
-
-    cleaned_major_minor = major_minor(cleaned)
-    latest_major_minor = major_minor(latest_cleaned)
-    if cleaned_major_minor is not None and cleaned_major_minor == latest_major_minor:
-        return f"🟡 {escape_markdown_table_cell(cleaned)}"
-
-    return f"🔴 {escape_markdown_table_cell(cleaned)}"
+    icon = {None: "⚪", False: "🟢", True: "🟡"}[update_available]
+    return f"{icon} {escape_markdown_table_cell(dep_version)}"
 
 
 def has_latest_release(entry: RepoEntry) -> bool:

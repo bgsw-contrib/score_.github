@@ -1,12 +1,115 @@
 from __future__ import annotations
 
 import json
-from typing import TypedDict, cast
+import re
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, TypedDict, cast
+from urllib.parse import unquote, urlsplit
 
 from repo_cache import default_cache_directory
 
+from generate_repo_overview.models import DependencyPinKind, parse_github_repository
+from generate_repo_overview.org_config import is_safe_repository_path
+
 from .git_checkout import sync_repository_checkout
 from .signal_detection import dedupe_preserving_order
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_VERSION = re.compile(
+    r"[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*"
+    r"(?:-[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?"
+    r"(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryCheckout:
+    repository: str
+    branch: str
+
+    def matches_url(self, url: str) -> bool:
+        """Match GitHub's raw URLs for the registry root on the cached branch."""
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return False
+        if parsed.scheme != "https" or parsed.query or parsed.fragment:
+            return False
+        parts = parsed.path.strip("/").split("/", 2)
+        if len(parts) != 3:
+            return False
+        owner, repo, ref = (unquote(part) for part in parts)
+        if f"{owner}/{repo}".casefold() != self.repository.casefold():
+            return False
+        if parsed.netloc.casefold() == "github.com" and ref.startswith("raw/"):
+            ref = ref.removeprefix("raw/")
+        elif parsed.netloc.casefold() != "raw.githubusercontent.com":
+            return False
+        return ref in (f"refs/heads/{self.branch}", self.branch)
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryGitSource:
+    repository: str
+    kind: DependencyPinKind
+    revision: str
+    package_modified: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryModule:
+    directory: Path
+    repositories: tuple[str, ...]
+    latest_version: str | None
+    versions: frozenset[str]
+
+    def has_version(self, version: str) -> bool:
+        return (
+            _VERSION.fullmatch(version) is not None
+            and version.partition("+")[0] in self.versions
+        )
+
+    def update_available(self, version: str) -> bool | None:
+        if self.latest_version is None or not self.has_version(version):
+            return None
+        pin = _bazel_version_key(version)
+        latest = _bazel_version_key(self.latest_version)
+        # A pin newer than the last non-yanked release may itself be yanked.
+        return pin < latest if pin <= latest else None
+
+    def git_source(self, version: str) -> RegistryGitSource | None:
+        if not _VERSION.fullmatch(version):
+            return None
+        normalized_version = version.partition("+")[0]
+        source = _read_object(self.directory / normalized_version / "source.json")
+        package_modified = bool(source.get("patches") or source.get("overlay"))
+        if source.get("type", "archive") == "archive":
+            url = source.get("url")
+            git_source = _github_archive_source(url) if isinstance(url, str) else None
+            return (
+                replace(git_source, package_modified=True)
+                if git_source is not None and package_modified
+                else git_source
+            )
+        if source.get("type") != "git_repository":
+            return None
+        remote = source.get("remote")
+        repository = (
+            parse_github_repository(remote) if isinstance(remote, str) else None
+        )
+        if repository is None:
+            return None
+        for kind in (
+            DependencyPinKind.COMMIT,
+            DependencyPinKind.TAG,
+            DependencyPinKind.BRANCH,
+        ):
+            revision = source.get(kind.value)
+            if isinstance(revision, str) and revision:
+                return RegistryGitSource(repository, kind, revision, package_modified)
+        return None
 
 
 class RegistrySignalsPayload(TypedDict):
@@ -173,3 +276,146 @@ def merge_bazel_registry_metadata(
         "latest_bazel_registry_version": existing["latest_bazel_registry_version"]
         or incoming["latest_bazel_registry_version"],
     }
+
+
+def get_bazel_registry_repositories_by_module(
+    *,
+    active_repository_names: set[str],
+    registry_repository: str,
+    org_name: str = "",
+) -> dict[str, str]:
+    active_by_identity = {name.casefold(): name for name in active_repository_names}
+    repositories: dict[str, str] = {}
+    for module, metadata in get_bazel_registry_modules(registry_repository).items():
+        for source in metadata.repositories:
+            owner, name = source.split("/")
+            if org_name and owner.casefold() != org_name.casefold():
+                continue
+            if active_name := active_by_identity.get(name.casefold()):
+                repositories.setdefault(module, active_name)
+    return repositories
+
+
+def get_bazel_registry_modules(
+    registry_repository: str, *, cache_directory: Path | None = None
+) -> dict[str, RegistryModule]:
+    """Read the source identities and latest non-yanked version of each module."""
+    if not is_safe_repository_path(registry_repository):
+        return {}
+
+    modules: dict[str, RegistryModule] = {}
+    for metadata_path in sorted(
+        ((cache_directory or default_cache_directory()) / registry_repository).glob(
+            "modules/*/metadata.json"
+        )
+    ):
+        metadata = _read_object(metadata_path)
+        entries = metadata.get("repository")
+        sources = tuple(
+            repository
+            for entry in (
+                cast("list[object]", entries) if isinstance(entries, list) else ()
+            )
+            if isinstance(entry, str)
+            and entry.startswith("github:")
+            and (
+                repository := parse_github_repository(
+                    "https://github.com/" + entry.removeprefix("github:")
+                )
+            )
+            is not None
+        )
+        raw_versions = metadata.get("versions")
+        versions = [
+            version
+            for version in (
+                cast("list[object]", raw_versions)
+                if isinstance(raw_versions, list)
+                else ()
+            )
+            if isinstance(version, str) and _VERSION.fullmatch(version)
+        ]
+        yanked = metadata.get("yanked_versions")
+        latest = max(
+            (
+                version
+                for version in versions
+                if not isinstance(yanked, dict) or version not in yanked
+            ),
+            key=_bazel_version_key,
+            default=None,
+        )
+        modules[metadata_path.parent.name] = RegistryModule(
+            metadata_path.parent,
+            sources,
+            latest,
+            frozenset(version.partition("+")[0] for version in versions),
+        )
+    return modules
+
+
+def _bazel_version_key(
+    version: str,
+) -> tuple[tuple[tuple[bool, int, str], ...], bool, tuple[tuple[bool, int, str], ...]]:
+    # Bazel uses SemVer precedence with any number of alphanumeric release
+    # identifiers. Build metadata does not affect precedence.
+    release, _, prerelease = version.partition("+")[0].partition("-")
+
+    def identifiers(part: str) -> tuple[tuple[bool, int, str], ...]:
+        return (
+            tuple(
+                (not item.isdigit(), int(item) if item.isdigit() else 0, item)
+                for item in part.split(".")
+            )
+            if part
+            else ()
+        )
+
+    return identifiers(release), not prerelease, identifiers(prerelease)
+
+
+def _read_object(path: Path) -> dict[str, object]:
+    try:
+        data: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return cast("dict[str, object]", data) if isinstance(data, dict) else {}
+
+
+def _github_archive_source(url: str) -> RegistryGitSource | None:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    parts = parsed.path.lstrip("/").split("/", 2)
+    if parsed.scheme != "https" or len(parts) != 3:
+        return None
+    owner, name, archive = parts
+    repository = parse_github_repository(f"https://github.com/{owner}/{name}")
+    if repository is None:
+        return None
+    archive_ref = _archive_ref(parsed.hostname, archive)
+    if archive_ref is None:
+        return None
+    revision = unquote(archive_ref)
+    for prefix, kind in (
+        ("refs/tags/", DependencyPinKind.TAG),
+        ("refs/heads/", DependencyPinKind.BRANCH),
+    ):
+        if revision.startswith(prefix) and revision != prefix:
+            return RegistryGitSource(repository, kind, revision.removeprefix(prefix))
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", revision):
+        return RegistryGitSource(repository, DependencyPinKind.COMMIT, revision)
+    return None
+
+
+def _archive_ref(host: str | None, path: str) -> str | None:
+    if host == "github.com" and path.startswith("archive/"):
+        for extension in (".tar.gz", ".zip"):
+            if path.endswith(extension):
+                return path.removeprefix("archive/").removesuffix(extension)
+    if host == "codeload.github.com":
+        archive_format, _, ref = path.partition("/")
+        if archive_format in ("tar.gz", "zip"):
+            return ref
+    return None

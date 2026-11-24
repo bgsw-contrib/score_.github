@@ -25,19 +25,20 @@ from .git_checkout import (
     get_checkout_head_date,
     get_checkout_head_sha,
     list_repository_paths,
+    list_repository_paths_at_ref,
     read_repository_text_at_ref,
     remote_repository_has_refs,
     sync_repository_checkout,
 )
 from .signal_detection import (
     DeepContentPayload,
-    detect_all_bazel_deps,
+    detect_bazel_dependencies,
     detect_bazel_lockfile_ok,
     detect_bazel_version,
     detect_top_languages,
     fetch_repository_tree_paths,
+    fetch_text_file,
     first_non_comment_line,
-    get_all_bazel_dep_versions,
     has_dependabot_config,
     inspect_repository_checkout,
     inspect_repository_content_slow,
@@ -45,6 +46,8 @@ from .signal_detection import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from generate_repo_overview.models import DependencyDeclaration
 
     from .registry_metadata import RegistrySignalsPayload
 
@@ -64,7 +67,7 @@ class LatestReleaseDetails(TypedDict):
     latest_release_ahead_of_default_branch_by: int | None
     default_branch_ahead_of_latest_release_by: int | None
     release_bazel_version: str | None
-    release_bazel_deps: tuple[tuple[str, str], ...]
+    release_bazel_deps: tuple[DependencyDeclaration, ...]
 
 
 class VolatileMetricsPayload(TypedDict):
@@ -82,7 +85,7 @@ class VolatileMetricsPayload(TypedDict):
     latest_release_ahead_of_default_branch_by: int | None
     default_branch_ahead_of_latest_release_by: int | None
     release_bazel_version: str | None
-    release_bazel_deps: tuple[tuple[str, str], ...]
+    release_bazel_deps: tuple[DependencyDeclaration, ...]
 
 
 MERGED_PULL_REQUEST_WINDOW_DAYS = 30
@@ -115,6 +118,7 @@ def collect_repository_entry(
     referenced_by_reference_integration: bool = False,
     workflow_signals: tuple[WorkflowSignal, ...] = (),
     github_token: str | None = None,
+    run_repository_tools: bool = True,
 ) -> RepoEntry:
     default_branch = cast("str | None", getattr(repository, "default_branch", None))
     print_status(f"{repository_name}: syncing default-branch checkout")
@@ -124,6 +128,10 @@ def collect_repository_entry(
         default_branch=default_branch,
         github_token=github_token,
     )
+    if cached_entry is not None and _cached_lockfile_status_is_outdated(
+        cached_entry, run_repository_tools=run_repository_tools
+    ):
+        cached_entry = None
     fast_entry = maybe_collect_repository_entry_fast_path(
         repository_name=repository_name,
         repository=repository,
@@ -151,6 +159,7 @@ def collect_repository_entry(
         cached_entry=cached_entry,
         workflow_signals=workflow_signals,
         github_token=github_token,
+        run_repository_tools=run_repository_tools,
         checkout_path=checkout_path,
         default_branch=default_branch,
         default_branch_sha=default_branch_sha,
@@ -261,6 +270,7 @@ def collect_repository_entry_slow_path(
     cached_entry: RepoEntry | None,
     workflow_signals: tuple[WorkflowSignal, ...] = (),
     github_token: str | None = None,
+    run_repository_tools: bool = True,
     checkout_path: Path | None = None,
     default_branch: str | None = None,
     default_branch_sha: str | None = None,
@@ -300,6 +310,7 @@ def collect_repository_entry_slow_path(
             repository=repository,
             default_branch=default_branch,
             checkout_path=checkout_path,
+            run_repository_tools=run_repository_tools,
         )
         content_signals["bazel_lockfile_status"] = lockfile_status
         content_signals["bazel_lockfile_error_output"] = lockfile_error
@@ -379,12 +390,32 @@ def _sync_content_checkout(
     return (synced, default_branch_sha)
 
 
+def _cached_lockfile_status_is_outdated(
+    cached_entry: RepoEntry, *, run_repository_tools: bool
+) -> bool:
+    """Tell whether the cached status predates a changed `run_repository_tools`.
+
+    An unchanged repository otherwise keeps its cached status, so the setting
+    would only take effect with the repository's next commit.
+    """
+    content = cached_entry.content
+    if not content.has_bazel_module:
+        return False
+    was_skipped = content.bazel_lockfile_status == LockfileStatus.SKIPPED
+    return was_skipped == run_repository_tools
+
+
 def _detect_lockfile_ok_for_repo(
     *,
     repository: Any,
     default_branch: str | None,
     checkout_path: Path | None = None,
+    run_repository_tools: bool = True,
 ) -> tuple[LockfileStatus, str | None]:
+    if not run_repository_tools:
+        # Bazel executes code from the repository, which could read and leak
+        # the GitHub token from the collector's environment.
+        return LockfileStatus.SKIPPED, None
     if checkout_path is not None:
         return detect_bazel_lockfile_ok(checkout_path)
     if default_branch is None:
@@ -884,7 +915,7 @@ def get_latest_release_details(
     if release_tag and checkout_path is not None:
         release_ref = fetch_repository_ref(
             checkout_path,
-            release_tag,
+            f"refs/tags/{release_tag}",
             github_token=github_token,
         )
         if release_ref is None:
@@ -896,12 +927,9 @@ def get_latest_release_details(
                 ".bazelversion",
             )
         )
-        bazel_deps = get_all_bazel_dep_versions(
-            read_repository_text_at_ref(
-                checkout_path,
-                release_ref,
-                "MODULE.bazel",
-            )
+        bazel_deps = detect_bazel_dependencies(
+            list_repository_paths_at_ref(checkout_path, release_ref),
+            lambda path: read_repository_text_at_ref(checkout_path, release_ref, path),
         )
         return {
             "version": release_tag,
@@ -925,10 +953,9 @@ def get_latest_release_details(
             tree_paths=release_tree,
             ref=release_tag,
         ),
-        "release_bazel_deps": detect_all_bazel_deps(
-            repository,
-            tree_paths=release_tree,
-            ref=release_tag,
+        "release_bazel_deps": detect_bazel_dependencies(
+            release_tree,
+            lambda path: fetch_text_file(repository, path, ref=release_tag),
         ),
     }
 

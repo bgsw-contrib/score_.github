@@ -83,6 +83,21 @@ override `grouping_levels`, `registry_repo`, or `reference_integration_repo`.
 Use an empty grouping list or an empty repository string to disable the
 corresponding setting for that organization.
 
+Collection can start tools inside repository checkouts. Currently this is the
+Bazel lockfile check. Such tools execute code from the repository and inherit
+the collector's environment, so that code could read and leak the GitHub
+token. `run_repository_tools` controls this per organization. It defaults to
+`true` for the primary organization and to `false` for additional
+organizations, whose lockfile status is then shown as `skipped`:
+
+```toml
+# Only for organizations whose default branches are trusted with the token.
+run_repository_tools = false
+
+[organizations.example-tools]
+run_repository_tools = true
+```
+
 The dashboard lists each organization's groups together in the combined view.
 Use the **Organization** selector to scope repository lists and the overview
 summary to one organization. The selected organization can be bookmarked with
@@ -170,3 +185,26 @@ Prefer:
 
 Avoid output-specific markers in the collector. Presentation belongs in the
 renderer.
+
+### Dependency Freshness
+
+Repository detail pages list the direct Bazel dependencies declared on the default
+branch and in the latest release, with root module overrides applied. Bazel may
+select a different version when it resolves the full dependency graph.
+
+- The **release** badge compares a registry pin with the latest non-yanked module
+  version. Git pins are compared with an identifiable release of that module.
+  Tracked dependency summaries use the same release status.
+- The **default branch** badge shows how many commits the pin is behind the
+  dependency's default branch and links to the comparison. A pin that has
+  diverged from the default branch is marked as such.
+
+An explicit registry URL in a `single_version_override` can be resolved when
+it points to the root of a configured GitHub registry's cached default branch.
+Other registry URLs leave the source unknown.
+
+The **Used by** section lists collected repositories that declare a direct
+dependency, along with their declared pins.
+Freshness and consumers are only known for repositories in the overview;
+external modules such as `rules_python` show their version only, and pins
+without a matching commit, tag, or branch are marked as unresolved.

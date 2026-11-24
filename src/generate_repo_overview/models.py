@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+from typing import Any, cast
+from urllib.parse import urlsplit
 
 
 class LockfileStatus(StrEnum):
@@ -14,13 +13,15 @@ class LockfileStatus(StrEnum):
     MISSING = "missing"
     ERROR = "error"
     TIMEOUT = "timeout"
+    # The organization does not run repository tools, so nothing was checked.
+    SKIPPED = "skipped"
     UNKNOWN = "unknown"
 
 
 DEFAULT_CATEGORY = "Uncategorized"
 DEFAULT_SUBCATEGORY = "General"
-SNAPSHOT_SCHEMA_VERSION = 31
-_LEGACY_SNAPSHOT_SCHEMA_VERSION = 30
+SNAPSHOT_SCHEMA_VERSION = 35
+_LEGACY_SNAPSHOT_SCHEMA_VERSIONS = (30, 31, 32, 33, 34)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,134 @@ class WorkflowRefResolution:
         )
 
 
+class DependencyOverride(StrEnum):
+    GIT = "git"
+    ARCHIVE = "archive"
+    LOCAL_PATH = "local_path"
+    SINGLE_VERSION = "single_version"
+
+
+class DependencyPinKind(StrEnum):
+    VERSION = "version"
+    COMMIT = "commit"
+    TAG = "tag"
+    BRANCH = "branch"
+
+
+@dataclass(frozen=True, slots=True)
+class DependencyDeclaration:
+    """One direct ``bazel_dep`` declaration and its root module override."""
+
+    module: str
+    version: str | None = None
+    override: DependencyOverride | None = None
+    remote: str | None = None
+    revision: str | None = None
+    pin_kind: DependencyPinKind = DependencyPinKind.VERSION
+    override_source: tuple[tuple[str, str], ...] = ()
+    # None selects the configured registry. An empty string means the override
+    # specified a registry expression that could not be evaluated.
+    registry_override: str | None = None
+
+    @property
+    def pinned_revision(self) -> str | None:
+        """The declared commit, tag, branch, or module version.
+
+        A ``git_override`` replaces the declared version. Archive and local-path
+        overrides have no revision in the dependency's Git history.
+        """
+        if self.override is DependencyOverride.GIT:
+            return self.revision
+        if self.override in (DependencyOverride.ARCHIVE, DependencyOverride.LOCAL_PATH):
+            return None
+        return self.version
+
+    @property
+    def display_version(self) -> str:
+        """The declared version or Git revision, shortened for display."""
+        if self.override is DependencyOverride.GIT:
+            if self.revision and self.pin_kind is DependencyPinKind.COMMIT:
+                return short_revision(self.revision)
+            return self.revision or "unknown"
+        if self.override in (DependencyOverride.ARCHIVE, DependencyOverride.LOCAL_PATH):
+            return "unknown"
+        return self.version or (
+            "unknown"
+            if self.override is DependencyOverride.SINGLE_VERSION
+            else "unversioned"
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DependencyDeclaration:
+        override = data.get("override")
+        return cls(
+            module=cast("str", data.get("module", "")),
+            version=cast("str | None", data.get("version")),
+            override=DependencyOverride(override)
+            if override in DependencyOverride
+            else None,
+            remote=cast("str | None", data.get("remote")),
+            revision=cast("str | None", data.get("revision")),
+            pin_kind=DependencyPinKind(data.get("pin_kind", DependencyPinKind.VERSION)),
+            override_source=normalize_string_pairs(data.get("override_source")),
+            registry_override=cast("str | None", data.get("registry_override")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DependencyResolution:
+    """Freshness of a declared pin relative to releases and the default branch."""
+
+    repository: str
+    revision: str
+    resolved_sha: str | None = None
+    latest_release: str | None = None
+    behind_latest_release_by: int | None = None
+    ahead_of_default_branch_by: int | None = None
+    behind_default_branch_by: int | None = None
+    pin_kind: DependencyPinKind = DependencyPinKind.VERSION
+    consumer_org: str = field(kw_only=True)
+    module: str = field(kw_only=True)
+    registry_override: str | None = field(default=None, kw_only=True)
+    registry_update_available: bool | None = field(default=None, kw_only=True)
+
+    @property
+    def release_update_available(self) -> bool | None:
+        """Whether there is a newer module package or a Git release to catch up to."""
+        if self.latest_release is None:
+            return None
+        if self.registry_update_available is not None:
+            return self.registry_update_available
+        if self.behind_latest_release_by is not None:
+            return self.behind_latest_release_by > 0
+        return None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DependencyResolution:
+        return cls(
+            repository=cast("str", data.get("repository", "")),
+            revision=cast("str", data.get("revision", "")),
+            resolved_sha=cast("str | None", data.get("resolved_sha")),
+            latest_release=cast("str | None", data.get("latest_release")),
+            behind_latest_release_by=cast(
+                "int | None", data.get("behind_latest_release_by")
+            ),
+            ahead_of_default_branch_by=cast(
+                "int | None", data.get("ahead_of_default_branch_by")
+            ),
+            behind_default_branch_by=cast(
+                "int | None", data.get("behind_default_branch_by")
+            ),
+            pin_kind=DependencyPinKind(data.get("pin_kind", DependencyPinKind.VERSION)),
+            consumer_org=cast("str", data.get("consumer_org", "")),
+            module=cast("str", data.get("module", "")),
+            registry_override=cast("str | None", data.get("registry_override")),
+            registry_update_available=cast(
+                "bool | None", data.get("registry_update_available")
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SphinxItem:
     """A feature or module declared in the platform Sphinx documentation."""
@@ -138,7 +267,7 @@ class DeepContentSignals:
     workflow_refs: tuple[tuple[str, str], ...] = ()
     has_coverage_config: bool = False
     top_languages: tuple[str, ...] = ()
-    bazel_deps: tuple[tuple[str, str], ...] = ()
+    bazel_deps: tuple[DependencyDeclaration, ...] = ()
     bazel_lockfile_status: LockfileStatus = LockfileStatus.UNKNOWN
     bazel_lockfile_error_output: str | None = None
     sphinx_features: tuple[SphinxItem, ...] = ()
@@ -205,7 +334,7 @@ class DeepContentSignals:
             workflow_refs=normalize_string_pairs(data.get("workflow_refs")),
             has_coverage_config=bool(data.get("has_coverage_config", False)),
             top_languages=normalize_string_tuple(data.get("top_languages")),
-            bazel_deps=normalize_string_pairs(data.get("bazel_deps")),
+            bazel_deps=_parse_dependencies(data.get("bazel_deps")),
             bazel_lockfile_status=_parse_lockfile_status(
                 data.get("bazel_lockfile_status")
             ),
@@ -258,7 +387,7 @@ class VolatileMetricsSnapshot:
     latest_release_ahead_of_default_branch_by: int | None = None
     default_branch_ahead_of_latest_release_by: int | None = None
     release_bazel_version: str | None = None
-    release_bazel_deps: tuple[tuple[str, str], ...] = ()
+    release_bazel_deps: tuple[DependencyDeclaration, ...] = ()
     volatile_metrics_fetched_at: str | None = None
     open_renovate_prs: int | None = None
     open_dependabot_prs: int | None = None
@@ -297,7 +426,7 @@ class VolatileMetricsSnapshot:
                 "str | None",
                 data.get("release_bazel_version"),
             ),
-            release_bazel_deps=normalize_string_pairs(data.get("release_bazel_deps")),
+            release_bazel_deps=_parse_dependencies(data.get("release_bazel_deps")),
             volatile_metrics_fetched_at=fetched_at,
         )
 
@@ -441,10 +570,74 @@ class RepoSnapshot:
     workflow_signals: tuple[WorkflowSignal, ...] = ()
     workflow_ref_resolutions: tuple[WorkflowRefResolution, ...] = ()
     additional_org_names: tuple[str, ...] = ()
+    module_repositories: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict[str, Mapping[str, str]]
+    )
+    dependency_resolutions: tuple[DependencyResolution, ...] = ()
+    dependency_sources_available: bool = True
+    _dependency_resolutions_by_pin: dict[
+        tuple[str, str, DependencyPinKind, str, str, str | None], DependencyResolution
+    ] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_dependency_resolutions_by_pin",
+            {
+                (
+                    resolution.consumer_org.casefold(),
+                    resolution.module,
+                    resolution.pin_kind,
+                    resolution.revision,
+                    resolution.repository.casefold()
+                    if resolution.pin_kind is not DependencyPinKind.VERSION
+                    else "",
+                    resolution.registry_override,
+                ): resolution
+                for resolution in self.dependency_resolutions
+            },
+        )
 
     @property
     def organization_names(self) -> tuple[str, ...]:
         return (self.org_name, *self.additional_org_names)
+
+    def dependency_repository(
+        self, consumer: RepoEntry, declaration: DependencyDeclaration
+    ) -> str | None:
+        resolution = self.dependency_resolution(consumer, declaration)
+        if resolution is not None:
+            return resolution.repository
+        if declaration.pinned_revision is not None:
+            # For a versioned pin, the module-wide mapping may point to a
+            # different registry's source. Git remotes identify their own source.
+            return dependency_repository(declaration, {})
+        owner = (consumer.owner or self.org_name).casefold()
+        return dependency_repository(
+            declaration, self.module_repositories.get(owner, {})
+        )
+
+    def dependency_resolution(
+        self, consumer: RepoEntry, declaration: DependencyDeclaration
+    ) -> DependencyResolution | None:
+        revision = declaration.pinned_revision
+        if revision is None:
+            return None
+        repository = (
+            dependency_repository(declaration, {})
+            if declaration.override is DependencyOverride.GIT
+            else None
+        )
+        return self._dependency_resolutions_by_pin.get(
+            (
+                (consumer.owner or self.org_name).casefold(),
+                declaration.module,
+                declaration.pin_kind,
+                revision,
+                (repository or "").casefold(),
+                declaration.registry_override,
+            )
+        )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RepoSnapshot:
@@ -455,7 +648,7 @@ class RepoSnapshot:
         schema_version = data.get("schema_version", SNAPSHOT_SCHEMA_VERSION)
         if schema_version not in (
             SNAPSHOT_SCHEMA_VERSION,
-            _LEGACY_SNAPSHOT_SCHEMA_VERSION,
+            *_LEGACY_SNAPSHOT_SCHEMA_VERSIONS,
         ):
             raise ValueError(
                 "Unsupported snapshot schema version "
@@ -472,9 +665,9 @@ class RepoSnapshot:
             )
 
         typed_repos_data = cast("list[Mapping[str, Any]]", repos_data)
-        # Schema 30 stored the organization once, at the snapshot level.
-        default_owner = (
-            org_name if schema_version == _LEGACY_SNAPSHOT_SCHEMA_VERSION else ""
+        dependency_sources_available = (
+            schema_version == SNAPSHOT_SCHEMA_VERSION
+            and data.get("dependency_sources_available", True) is True
         )
 
         tracked_deps = tuple(
@@ -501,7 +694,9 @@ class RepoSnapshot:
             org_name=org_name,
             generated_at=generated_at,
             repos=tuple(
-                RepoEntry.from_dict(repo, default_owner=default_owner)
+                RepoEntry.from_dict(
+                    repo, default_owner=org_name if schema_version == 30 else ""
+                )
                 for repo in typed_repos_data
             ),
             additional_org_names=normalize_string_tuple(
@@ -514,6 +709,22 @@ class RepoSnapshot:
                 for item in (data.get("workflow_ref_resolutions") or ())
                 if isinstance(item, dict) and isinstance(item.get("reference"), str)
             ),
+            module_repositories=_parse_module_repositories(
+                data.get("module_repositories")
+                if dependency_sources_available
+                else None
+            ),
+            dependency_resolutions=tuple(
+                DependencyResolution.from_dict(cast("Mapping[str, Any]", item))
+                for item in (data.get("dependency_resolutions") or ())
+                if dependency_sources_available
+                and isinstance(item, dict)
+                and isinstance(item.get("repository"), str)
+                and isinstance(item.get("revision"), str)
+                and isinstance(item.get("consumer_org"), str)
+                and isinstance(item.get("module"), str)
+            ),
+            dependency_sources_available=dependency_sources_available,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -528,6 +739,12 @@ class RepoSnapshot:
             "workflow_ref_resolutions": [
                 asdict(r) for r in self.workflow_ref_resolutions
             ],
+            "module_repositories": {
+                owner: dict(sorted(modules.items()))
+                for owner, modules in sorted(self.module_repositories.items())
+            },
+            "dependency_resolutions": [asdict(r) for r in self.dependency_resolutions],
+            "dependency_sources_available": self.dependency_sources_available,
         }
 
 
@@ -579,14 +796,86 @@ def _parse_sphinx_items(value: object) -> tuple[SphinxItem, ...]:
     )
 
 
-def lookup_bazel_dep_version(
-    bazel_deps: tuple[tuple[str, str], ...],
-    dep_name: str,
+def _parse_dependencies(value: object) -> tuple[DependencyDeclaration, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    items = cast("tuple[object, ...]", tuple(value))
+    declarations = tuple(
+        DependencyDeclaration.from_dict(cast("Mapping[str, Any]", item))
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("module"), str)
+    )
+    legacy = tuple(
+        DependencyDeclaration(module, version)
+        for module, version in normalize_string_pairs(items)
+    )
+    return declarations + legacy
+
+
+def _parse_module_repositories(value: object) -> dict[str, Mapping[str, str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        owner.casefold(): {
+            module: repo
+            for module, repo in cast("dict[object, object]", modules).items()
+            if isinstance(module, str) and isinstance(repo, str)
+        }
+        for owner, modules in cast("dict[object, object]", value).items()
+        if isinstance(owner, str) and isinstance(modules, dict)
+    }
+
+
+def dependency_repository(
+    declaration: DependencyDeclaration,
+    module_repositories: Mapping[str, str],
 ) -> str | None:
-    for name, version in bazel_deps:
-        if name == dep_name:
-            return version
+    """Return the declared source or the organization's usual source for a module."""
+    if declaration.override is DependencyOverride.GIT:
+        return (
+            parse_github_repository(declaration.remote) if declaration.remote else None
+        )
+    if declaration.registry_override is not None or declaration.override in (
+        DependencyOverride.ARCHIVE,
+        DependencyOverride.LOCAL_PATH,
+    ):
+        return None
+    return module_repositories.get(declaration.module)
+
+
+def parse_github_repository(remote: str) -> str | None:
+    """Return ``owner/name`` for a GitHub HTTPS or SSH remote."""
+    if remote.startswith("git@github.com:"):
+        remote = f"ssh://git@github.com/{remote.removeprefix('git@github.com:')}"
+    try:
+        parsed = urlsplit(remote)
+    except ValueError:
+        return None
+    if parsed.hostname != "github.com":
+        return None
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) != 2:
+        return None
+    owner, name = parts[0], parts[1].removesuffix(".git")
+    if (
+        re.fullmatch(r"[A-Za-z0-9-]+", owner)
+        and re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+        and name not in {".", ".."}
+    ):
+        return f"{owner}/{name}"
     return None
+
+
+def short_revision(revision: str) -> str:
+    """Abbreviate full commit hashes; keep tags and branch names readable."""
+    return revision[:7] if re.fullmatch(r"[0-9a-f]{40}", revision) else revision
+
+
+def lookup_bazel_dependency(
+    bazel_deps: tuple[DependencyDeclaration, ...],
+    dep_name: str,
+) -> DependencyDeclaration | None:
+    return next((dep for dep in bazel_deps if dep.module == dep_name), None)
 
 
 def is_tracked_dep_repo(
@@ -594,7 +883,7 @@ def is_tracked_dep_repo(
     tracked_deps: tuple[TrackedDep, ...],
 ) -> bool:
     return any(
-        lookup_bazel_dep_version(entry.content.bazel_deps, dep.module_name) is not None
+        lookup_bazel_dependency(entry.content.bazel_deps, dep.module_name) is not None
         or entry.matches_repository(dep.repo)
         for dep in tracked_deps
     )

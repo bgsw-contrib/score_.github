@@ -6,15 +6,21 @@ from ._html_common import (
     CSS,
     DOCS_ICON,
     GITHUB_ICON,
+    bazel_version_badge,
+    dependency_version_badge,
     docs_url,
     e,
     language_badge,
     uses_docs_as_code,
-    version_badge,
     workflow_ref_badges,
 )
+from ._html_dependencies import render_dependencies_section, render_used_by_section
 from .metrics_report import tracked_dep_label
-from .models import DEFAULT_CATEGORY, DEFAULT_SUBCATEGORY, LockfileStatus
+from .models import (
+    DEFAULT_CATEGORY,
+    DEFAULT_SUBCATEGORY,
+    LockfileStatus,
+)
 
 if TYPE_CHECKING:
     from .models import RepoEntry, RepoSnapshot
@@ -24,7 +30,6 @@ def render_detail_page(
     entry: RepoEntry,
     snapshot: RepoSnapshot,
     max_bazel: tuple[int, ...] | None,
-    latest_dep_versions: dict[str, str | None],
 ) -> str:
     org_name = entry.owner or snapshot.org_name
     site_root = "../" * entry.detail_path(snapshot.org_name).count("/")
@@ -39,12 +44,13 @@ def render_detail_page(
         + _render_hero(entry, org_name, site_root)
         + _render_stat_grid(entry)
         + _render_release_section(entry)
-        + _render_dep_diff_section(entry)
+        + render_dependencies_section(entry, snapshot, site_root)
+        + render_used_by_section(entry, snapshot, site_root)
         + _render_tooling_section(entry)
         + _render_workflows_section(entry, snapshot)
         + _render_lockfile_error_section(entry)
         + _render_ownership_section(entry)
-        + _render_versions_section(entry, snapshot, max_bazel, latest_dep_versions)
+        + _render_versions_section(entry, snapshot, max_bazel)
         + _render_footer(snapshot, site_root)
         + "</body>\n</html>\n"
     )
@@ -161,96 +167,6 @@ def _render_release_section(entry: RepoEntry) -> str:
     )
 
 
-def _render_dep_diff_section(entry: RepoEntry) -> str:
-    v = entry.volatile
-    if v.latest_release_version is None:
-        return ""
-
-    head_deps = dict(entry.content.bazel_deps)
-    release_deps = dict(v.release_bazel_deps)
-
-    all_names = sorted(set(head_deps) | set(release_deps))
-
-    head_bazel = entry.content.bazel_version
-    release_bazel = v.release_bazel_version
-
-    rows: list[str] = []
-
-    bazel_status, bazel_class = _dep_diff_status(head_bazel, release_bazel)
-    rows.append(
-        f"      <tr>\n"
-        f"        <td><span class='mono'>Bazel</span></td>\n"
-        f"        <td><span class='mono'>{e(head_bazel) if head_bazel else '<span class="text-muted">—</span>'}</span></td>\n"
-        f"        <td><span class='mono'>{e(release_bazel) if release_bazel else '<span class="text-muted">—</span>'}</span></td>\n"
-        f"        <td>{_dep_status_badge(bazel_status, bazel_class)}</td>\n"
-        f"      </tr>"
-    )
-
-    for name in all_names:
-        head_ver = head_deps.get(name)
-        rel_ver = release_deps.get(name)
-        status, css_class = _dep_diff_status(head_ver, rel_ver)
-        rows.append(
-            f"      <tr>\n"
-            f"        <td><span class='mono'>{e(name)}</span></td>\n"
-            f"        <td><span class='mono'>{e(head_ver) if head_ver else '<span class="text-muted">—</span>'}</span></td>\n"
-            f"        <td><span class='mono'>{e(rel_ver) if rel_ver else '<span class="text-muted">—</span>'}</span></td>\n"
-            f"        <td>{_dep_status_badge(status, css_class)}</td>\n"
-            f"      </tr>"
-        )
-
-    changed_count = sum(
-        1 for r in rows if "badge yellow" in r or "badge green" in r or "badge red" in r
-    )
-
-    if changed_count == 0 and v.commits_since_latest_release:
-        summary = (
-            f'<p class="text-muted" style="margin:0 0 0.5rem">No dependency changes since '
-            f"{e(v.latest_release_version)}.</p>"
-        )
-    else:
-        summary = ""
-
-    release_label = e(v.latest_release_version)
-    table = (
-        f"  <table>\n"
-        f"    <thead><tr>\n"
-        f"      <th>Dependency</th>\n"
-        f"      <th>HEAD</th>\n"
-        f"      <th>Release ({release_label})</th>\n"
-        f"      <th>Status</th>\n"
-        f"    </tr></thead>\n"
-        f"    <tbody>\n" + "\n".join(rows) + "\n    </tbody>\n  </table>"
-    )
-
-    return (
-        '<section class="detail-section">\n'
-        '  <div class="section-header">'
-        '<span class="section-title">Dependencies: HEAD vs. Release</span>'
-        "</div>\n"
-        f'  <div class="detail-body">{summary}{table}</div>\n'
-        "</section>\n\n"
-    )
-
-
-def _dep_diff_status(head: str | None, release: str | None) -> tuple[str, str]:
-    if head is None and release is None:
-        return "—", "muted"
-    if release is None:
-        return "added", "green"
-    if head is None:
-        return "removed", "red"
-    if head == release:
-        return "—", "muted"
-    return "changed", "yellow"
-
-
-def _dep_status_badge(status: str, css_class: str) -> str:
-    if status == "—":
-        return '<span class="text-muted">—</span>'
-    return f'<span class="badge {css_class}">{e(status)}</span>'
-
-
 def _render_tooling_section(entry: RepoEntry) -> str:
     c = entry.content
     signals: list[tuple[bool, str]] = [
@@ -350,15 +266,12 @@ def _render_versions_section(
     entry: RepoEntry,
     snapshot: RepoSnapshot,
     max_bazel: tuple[int, ...] | None,
-    latest_dep_versions: dict[str, str | None],
 ) -> str:
-    from .models import lookup_bazel_dep_version
+    from .models import lookup_bazel_dependency
 
     items: list[str] = []
 
-    bazel_badge = version_badge(
-        entry.content.bazel_version, max_bazel, latest_dep_version=None, is_bazel=True
-    )
+    bazel_badge = bazel_version_badge(entry.content.bazel_version, max_bazel)
     items.append(
         f'<div class="info-item">'
         f'<div class="info-label">Bazel Version</div>{bazel_badge}</div>'
@@ -366,14 +279,11 @@ def _render_versions_section(
 
     for dep in snapshot.tracked_deps:
         dep_label = tracked_dep_label(dep)
-        dep_ver = lookup_bazel_dep_version(entry.content.bazel_deps, dep.module_name)
-        latest_ver = latest_dep_versions.get(dep.module_name)
-        badge = version_badge(
-            dep_ver, None, latest_dep_version=latest_ver, is_bazel=False
-        )
+        declaration = lookup_bazel_dependency(entry.content.bazel_deps, dep.module_name)
+        badge = dependency_version_badge(declaration, entry, snapshot)
         items.append(
             f'<div class="info-item">'
-            f'<div class="info-label">{e(dep_label)} Version</div>{badge}</div>'
+            f'<div class="info-label" title="Declared Bazel dependency">{e(dep_label)} Version</div>{badge}</div>'
         )
 
     pin_version = entry.content.reference_integration_version
