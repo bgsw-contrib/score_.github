@@ -41,18 +41,25 @@ cloned again.
 
 A changed repository with `MODULE.bazel` and `MODULE.bazel.lock` is checked
 with `bazel mod deps --lockfile_mode=error`. The result is a content signal, so
-an unchanged repository is not checked again.
+an unchanged repository is not checked again. The exception is a check that
+timed out or could not start Bazel: it is repeated on every collection until
+it produces a result.
 
 Bazel executes code from the repository and inherits the collector's
 environment, including the GitHub token. The check therefore runs only for
 organizations with `run_repository_tools` enabled. Other repositories report
-`skipped`.
+`skipped`, or `missing` when they have no `MODULE.bazel.lock`, which is
+determined without Bazel.
 
 Repositories are collected in parallel, but only one lockfile check runs at a
 time. Bazel already uses all cores, and concurrent checks would overload small
 CI runners. Each checkout has its own Bazel server. The collector shuts it down
 after the check. A short idle limit stops servers whose shutdown did not
 succeed.
+
+A check times out after 120 seconds. Set
+`REPO_OVERVIEW_BAZEL_LOCKFILE_TIMEOUT_SECONDS` to change this, for example on
+runners that start with a cold Bazel cache.
 
 ## Transport Split
 
@@ -109,8 +116,19 @@ even though that branch cannot be resolved. After a failed checkout, the
 collector checks the default branch through the GitHub API before falling back
 to an authenticated `ls-remote` check. A missing default branch, or a reachable
 remote without references, is collected as an empty repository with neutral
-content signals; transport errors and non-empty checkout failures remain
-errors.
+content signals; transport errors and non-empty checkout failures fail the
+collection of that repository.
+
+## Failed Repositories
+
+A repository whose collection fails does not stop the collection. Its entry
+from the previous snapshot is kept unchanged; without one, the repository is
+left out until a later collection succeeds. Each failure and a summary are
+logged as warnings. The dashboard does not mark a kept entry as outdated.
+
+The command fails when more than half of an organization's repositories fail,
+and more than one. The cause is then a broken token, an exhausted rate limit,
+or an unreachable GitHub, not a single repository.
 
 ## Schema Changes
 

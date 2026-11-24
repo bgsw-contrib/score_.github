@@ -60,6 +60,9 @@ repository.
 Use `--config /path/to/file.toml` with `render-overview` to select another
 profile configuration.
 
+The organization config rejects settings it does not know, so a misspelled
+key fails the command instead of silently using its default.
+
 ### Multiple Organizations
 
 Keep `org_name` as the primary organization and add one `organizations` table
@@ -88,7 +91,8 @@ Bazel lockfile check. Such tools execute code from the repository and inherit
 the collector's environment, so that code could read and leak the GitHub
 token. `run_repository_tools` controls this per organization. It defaults to
 `true` for the primary organization and to `false` for additional
-organizations, whose lockfile status is then shown as `skipped`:
+organizations, whose lockfile status is then shown as `skipped`, or as
+`missing` when there is no lockfile:
 
 ```toml
 # Only for organizations whose default branches are trusted with the token.

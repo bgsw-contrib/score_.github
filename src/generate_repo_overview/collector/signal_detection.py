@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import subprocess
 import threading
@@ -80,7 +81,10 @@ WORKFLOW_PATH_PREFIX = ".github/workflows/"
 WORKFLOW_FILE_SUFFIXES = (".yml", ".yaml")
 
 
-BAZEL_LOCKFILE_TIMEOUT_SECONDS = 60
+DEFAULT_BAZEL_LOCKFILE_TIMEOUT_SECONDS = 120.0
+BAZEL_LOCKFILE_TIMEOUT_ENV = "REPO_OVERVIEW_BAZEL_LOCKFILE_TIMEOUT_SECONDS"
+# Larger values overflow the subprocess timeout and are no meaningful limit.
+_MAX_BAZEL_LOCKFILE_TIMEOUT_SECONDS = 24 * 60 * 60
 BAZEL_SHUTDOWN_TIMEOUT_SECONDS = 30
 # Every checkout gets its own Bazel server, which outlives its command. The
 # idle limit stops a server whose explicit shutdown did not succeed. Shutdown
@@ -91,7 +95,9 @@ _BAZEL_COMMAND = ("bazel", "--max_idle_secs=30")
 _BAZEL_LOCKFILE_CHECK_LOCK = threading.Lock()
 
 
-def detect_bazel_lockfile_ok(checkout_path: Path) -> tuple[LockfileStatus, str | None]:
+def detect_bazel_lockfile_ok(
+    checkout_path: Path, *, run_bazel: bool = True
+) -> tuple[LockfileStatus, str | None]:
     """Run `bazel mod deps --lockfile_mode=error` in the checkout.
 
     Only one check runs at a time, and its Bazel server is stopped afterwards.
@@ -101,12 +107,15 @@ def detect_bazel_lockfile_ok(checkout_path: Path) -> tuple[LockfileStatus, str |
       (ERROR,   stderr)  — lockfile check failed
       (MISSING, None)    — MODULE.bazel.lock does not exist
       (TIMEOUT, None)    — bazel timed out
+      (SKIPPED, None)    — lockfile exists, but Bazel must not run
       (UNKNOWN, None)    — bazel unavailable or MODULE.bazel missing
     """
     if not (checkout_path / "MODULE.bazel").exists():
         return LockfileStatus.UNKNOWN, None
     if not (checkout_path / "MODULE.bazel.lock").exists():
         return LockfileStatus.MISSING, None
+    if not run_bazel:
+        return LockfileStatus.SKIPPED, None
     with _BAZEL_LOCKFILE_CHECK_LOCK:
         try:
             return _run_bazel_lockfile_check(checkout_path)
@@ -114,12 +123,26 @@ def detect_bazel_lockfile_ok(checkout_path: Path) -> tuple[LockfileStatus, str |
             _shutdown_bazel_server(checkout_path)
 
 
+def resolve_bazel_lockfile_timeout_seconds() -> float:
+    """Read the timeout of one lockfile check; invalid values use the default."""
+    raw_value = os.getenv(BAZEL_LOCKFILE_TIMEOUT_ENV, "").strip()
+    try:
+        timeout = float(raw_value)
+    except ValueError:
+        return DEFAULT_BAZEL_LOCKFILE_TIMEOUT_SECONDS
+    # Also rejects NaN, which fails every comparison.
+    if not 0 < timeout <= _MAX_BAZEL_LOCKFILE_TIMEOUT_SECONDS:
+        return DEFAULT_BAZEL_LOCKFILE_TIMEOUT_SECONDS
+    return timeout
+
+
 def _run_bazel_lockfile_check(
     checkout_path: Path,
 ) -> tuple[LockfileStatus, str | None]:
     started = monotonic()
+    timeout = resolve_bazel_lockfile_timeout_seconds()
     print_status(
-        f"{checkout_path}: starting Bazel lockfile check (timeout {BAZEL_LOCKFILE_TIMEOUT_SECONDS}s)"
+        f"{checkout_path}: starting Bazel lockfile check (timeout {timeout:g}s)"
     )
     try:
         result = subprocess.run(
@@ -129,7 +152,7 @@ def _run_bazel_lockfile_check(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=BAZEL_LOCKFILE_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except OSError as exc:
         print_status(f"{checkout_path}: Bazel lockfile check could not start: {exc}")
