@@ -1,12 +1,38 @@
 # Organization configuration for generate-repo-overview.
 #
-# This file defines which GitHub organization to scan and how to detect
+# This file defines which GitHub organizations to scan and how to detect
 # repository signals.  Collection requires this file via --org-config; the
 # HTML renderer discovers it automatically when it is named org_config.toml.
 #
 # For a different organization, copy this file and adjust the values.
 
-org_name = "eclipse-score"
+# One table per GitHub organization. The first one is the primary
+# organization: its repositories keep short names and detail page paths in
+# the rendered output. Further organizations are collected into the same
+# dashboard, each with only the settings of its own table, including its
+# tracked dependencies and workflow signals.
+[organizations.eclipse-score]
+
+# Required. Allows collection to start tools such as Bazel inside repository
+# checkouts. These tools execute code from the repository with the collector's
+# environment, so that code could read and leak the GitHub token. Set it to
+# true only for organizations whose default branches are trusted with that
+# token. Collection currently starts no such tools.
+run_repository_tools = true
+
+# Optional fnmatch glob patterns to limit which repositories are included.
+# When empty (or omitted), all non-archived repositories in the org are included.
+# Example: repo_include_patterns = ["my-prefix-*", "another-repo"]
+# repo_include_patterns = []
+
+# Repository (org/repo) that serves as the reference integration project.
+# Its MODULE.bazel is parsed to determine which other repositories are
+# referenced as Bazel dependencies. Omit it if there is none.
+reference_integration_repo = "eclipse-score/reference_integration"
+
+# Full "org/repo" path to the Bazel registry repository. Omit it if there is
+# none.
+registry_repo = "eclipse-score/bazel_registry"
 
 # Grouping levels control how repositories are grouped in the rendered output.
 # Each level maps a GitHub repository custom property key to a fallback value
@@ -15,68 +41,53 @@ org_name = "eclipse-score"
 # 0 levels — all repositories fall back to the default label ("Uncategorized"),
 #             so they appear under a single section with no meaningful grouping.
 # 1 level  — repositories are grouped into top-level sections only.
-# 2 levels — repositories are grouped into sections and subsections (default).
+# 2 levels — repositories are grouped into sections and subsections.
 #
 # property: the GitHub custom property key to read from each repository.
 # default:  the fallback label shown when a repository has no value for that property.
-#
-# Remove or comment out one entry to use only one level of grouping.
-# Remove both entries (or omit the [grouping] section) for no grouping.
-[[grouping.levels]]
+[[organizations.eclipse-score.grouping_levels]]
 property = "category"
 default = "Uncategorized"
 
-[[grouping.levels]]
+[[organizations.eclipse-score.grouping_levels]]
 property = "subcategory"
 default = "General"
 
-# Optional fnmatch glob patterns to limit which repositories are included.
-# When empty (or omitted), all non-archived repositories in the org are included.
-# Example: repo_include_patterns = ["my-prefix-*", "another-repo"]
-# repo_include_patterns = []
-
-[signals]
-
-# Repository (org/repo) that serves as the reference integration project.
-# Its MODULE.bazel is parsed to determine which other repositories are
-# referenced as Bazel dependencies.
-# Leave empty if there is no reference integration repository.
-reference_integration_repo = "eclipse-score/reference_integration"
-
-# Full "org/repo" path to the Bazel registry repository.
-# Leave empty if there is no Bazel registry.
-registry_repo = "eclipse-score/bazel_registry"
-
-# Platform documentation repositories. Multiple entries may provide public and
-# private feature trees in parallel; their discovered metadata is merged.
-platform_repos = ["eclipse-score/score"]
-
 # Tracked Bazel dependencies.  Each entry maps a source repository (org/repo)
-# to its Bazel module name.  The tool looks up each module_name in every
-# repository's MODULE.bazel to report dependency versions.
-[[signals.tracked_deps]]
+# to its Bazel module name.  The tool looks up each module_name in the
+# MODULE.bazel of every repository of this organization to report dependency
+# versions.
+[[organizations.eclipse-score.tracked_deps]]
 repo = "eclipse-score/docs-as-code"
 module_name = "score_docs_as_code"
 
 # Named workflow signals.  Each entry has a human-readable label shown in the
 # metrics output, and a prefix matching job-level uses references in
-# .github/workflows/*.yml and *.yaml files. The Workflows tab shows each
-# distinct tag, branch, or commit pin. Omit these entries to hide the tab.
-[[signals.workflow_signals]]
+# .github/workflows/*.yml and *.yaml files of this organization's repositories.
+# The Workflows tab shows each distinct tag, branch, or commit pin. Omit these
+# entries to hide the tab.
+[[organizations.eclipse-score.workflow_signals]]
 label = "Daily Workflow"
 reference = "eclipse-score/cicd-workflows/.github/workflows/daily.yml@"
 
-[[signals.workflow_signals]]
+[[organizations.eclipse-score.workflow_signals]]
 label = "Docs"
 reference = "eclipse-score/cicd-workflows/.github/workflows/docs.yml@"
 
-[[signals.workflow_signals]]
+[[organizations.eclipse-score.workflow_signals]]
 label = "Docs Publish"
 reference = "eclipse-score/cicd-workflows/.github/workflows/docs-publish.yml@"
 
-[[signals.workflow_signals]]
+[[organizations.eclipse-score.workflow_signals]]
 label = "On-PR"
 reference = "eclipse-score/cicd-workflows/.github/workflows/on-pr.yml@"
+
+[signals]
+
+# Platform documentation repositories. Multiple entries may provide public and
+# private feature trees in parallel; their discovered metadata is merged and
+# associated with repositories of all organizations.
+platform_repos = ["eclipse-score/score"]
 
 # Optional policy-sync report consumed by the HTML metrics dashboard.  The
 # report is generated by the configured workflow in the source repository and

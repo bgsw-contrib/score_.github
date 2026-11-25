@@ -21,10 +21,11 @@ from generate_repo_overview.constants import (
 from generate_repo_overview.models import (
     SNAPSHOT_SCHEMA_VERSION,
     CustomPropertyValue,
+    OrganizationSignals,
     RepoEntry,
     RepoSnapshot,
 )
-from generate_repo_overview.org_config import OrgConfig
+from generate_repo_overview.org_config import OrgConfig, OverviewConfig
 
 from . import (
     dependency_resolution,
@@ -115,7 +116,7 @@ def get_gh_auth_token() -> str | None:
 
 def ensure_snapshot(
     *,
-    config: OrgConfig,
+    config: OverviewConfig,
     cache_path: Path = DEFAULT_CACHE,
     token_env: str = DEFAULT_TOKEN_ENV,
     refresh: bool = False,
@@ -140,7 +141,7 @@ def ensure_snapshot(
 
 def collect_snapshot(
     *,
-    config: OrgConfig,
+    config: OverviewConfig,
     token_env: str = DEFAULT_TOKEN_ENV,
     cache_path: Path | None = DEFAULT_CACHE,
     status_prefix: str = "repo-overview",
@@ -159,7 +160,7 @@ def collect_snapshot(
             "Missing PyGithub. Install project dependencies before running the generator."
         ) from exc
 
-    org_name = config.org_name
+    org_name = config.primary.org_name
 
     token = resolve_github_token(token_env)
     if not token:
@@ -183,7 +184,7 @@ def collect_snapshot(
     previous_gh_token = os.environ.get("GH_TOKEN")
     os.environ["GH_TOKEN"] = token
     try:
-        configs = config.collection_configs()
+        configs = config.organizations
         repos: list[RepoEntry] = []
         registries: dict[str, registry_metadata.RegistryCheckout | None] = {}
         for org_config in configs:
@@ -217,8 +218,13 @@ def collect_snapshot(
             additional_org_names=tuple(c.org_name for c in configs[1:]),
             generated_at=datetime.now(UTC).isoformat(),
             repos=tuple(repos),
-            tracked_deps=config.tracked_deps,
-            workflow_signals=config.workflow_signals,
+            organization_signals={
+                org.org_name.casefold(): OrganizationSignals(
+                    tracked_deps=org.tracked_deps,
+                    workflow_signals=org.workflow_signals,
+                )
+                for org in configs
+            },
             workflow_ref_resolutions=workflow_versions.fetch_workflow_ref_resolutions(
                 repos, github=github, status_prefix=status_prefix
             ),
@@ -458,7 +464,8 @@ def fetch_repositories(
             f"{repo.owner or existing_snapshot.org_name}/{repo.name}".casefold(): repo
             for repo in existing_snapshot.repos
         }
-        if config.workflow_signals == existing_snapshot.workflow_signals:
+        cached_signals = existing_snapshot.signals_for(config.org_name)
+        if config.workflow_signals == cached_signals.workflow_signals:
             cached_by_full_name = earlier_by_full_name
         else:
             print_status(
@@ -516,7 +523,6 @@ def fetch_repositories(
                 ),
                 workflow_signals=config.workflow_signals,
                 github_token=github_token,
-                run_repository_tools=config.run_repository_tools,
             )
             future = executor.submit(
                 _collect_entry_with_reference_refs,

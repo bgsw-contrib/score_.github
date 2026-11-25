@@ -10,7 +10,6 @@ import pytest
 import generate_repo_overview.collector as collector
 import generate_repo_overview.collector.dependency_resolution as dependency_resolution
 from generate_repo_overview.metrics_html import render_all_pages
-from generate_repo_overview.metrics_report import render_versions_section
 from generate_repo_overview.models import (
     DeepContentSignals,
     DependencyDeclaration,
@@ -22,7 +21,7 @@ from generate_repo_overview.models import (
     TrackedDep,
     VolatileMetricsSnapshot,
 )
-from generate_repo_overview.org_config import OrganizationSettings, OrgConfig
+from generate_repo_overview.org_config import OrgConfig, OverviewConfig
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -449,14 +448,21 @@ def test_registry_versions_and_consumers_use_their_organizations_registry(
             if repo.owner == owner
         ],
     )
-    config = OrgConfig(
-        org_name="first-org",
-        registry_repo="FIRST-ORG/REGISTRY",
-        additional_organizations=(
-            OrganizationSettings("second-org", registry_repo="second-org/registry"),
-            OrganizationSettings("disabled-org", registry_repo=""),
-        ),
-        tracked_deps=(TrackedDep(first_source, "score_python_basics"),),
+    tracked_deps = (TrackedDep(first_source, "score_python_basics"),)
+    config = OverviewConfig(
+        organizations=(
+            OrgConfig(
+                "first-org",
+                registry_repo="FIRST-ORG/REGISTRY",
+                tracked_deps=tracked_deps,
+            ),
+            OrgConfig(
+                "second-org",
+                registry_repo="second-org/registry",
+                tracked_deps=tracked_deps,
+            ),
+            OrgConfig("disabled-org", tracked_deps=tracked_deps),
+        )
     )
     snapshot = collector.collect_snapshot(config=config, cache_path=None)
     snapshot = RepoSnapshot.from_dict(snapshot.to_dict())
@@ -528,8 +534,3 @@ def test_registry_versions_and_consumers_use_their_organizations_registry(
         )
         == 4
     )  # Two consumers, each in the table and card views.
-    markdown = render_versions_section(list(snapshot.repos), snapshot=snapshot)
-    assert any(
-        "first-org-consumer)" in line and "🟡 0.3.4" in line for line in markdown
-    )
-    assert any("override-consumer)" in line and "🟢 0.3.4" in line for line in markdown)

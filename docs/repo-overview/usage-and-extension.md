@@ -45,10 +45,10 @@ GitHub CLI (`gh auth login` is sufficient for local use).
 
 ## Configuration
 
-`org_config.toml` defines the organization, repository selection and grouping,
-tracked Bazel dependencies, workflow signals, shared registry and reference
-integration repositories, platform documentation repositories, and optional
-policy-sync report metadata. Category order and descriptions for the profile
+`org_config.toml` defines the organizations with their repository selection,
+grouping, registry, and reference integration repositories; tracked Bazel
+dependencies, workflow signals, and platform documentation repositories; and
+optional policy-sync report metadata. Category order and descriptions for the profile
 are stored in
 `src/generate_repo_overview/profile_readme_config.toml`.
 
@@ -63,53 +63,49 @@ profile configuration.
 The organization config rejects settings it does not know, so a misspelled
 key fails the command instead of silently using its default.
 
-### Multiple Organizations
+### Organizations
 
-Keep `org_name` as the primary organization and add one `organizations` table
-per additional GitHub organization. Each organization has its own repository name
-filters. An omitted or empty filter includes all its active repositories.
+Each GitHub organization has its own `[organizations.<name>]` table. An
+organization uses only the settings of its own table; nothing is inherited
+from another organization. Omit `registry_repo`, `reference_integration_repo`,
+or `grouping_levels` when the organization has none.
 
 ```toml
-org_name = "example-platform"
+[organizations.example-platform]
+run_repository_tools = true
 repo_include_patterns = ["platform-*"]
+registry_repo = "example-platform/bazel-registry"
+reference_integration_repo = "example-platform/integration"
+grouping_levels = [{ property = "category", default = "Uncategorized" }]
 
 [organizations.example-tools]
+run_repository_tools = false
 repo_include_patterns = ["compiler", "build-*"]
 grouping_levels = [{ property = "team", default = "Tooling" }]
-registry_repo = "example-tools/bazel-registry"
 ```
 
-Tracked dependencies, workflow signals, and platform documentation sources
-apply to the combined dashboard. Additional organizations inherit the primary
-grouping levels, registry, and Reference Integration unless they
-override `grouping_levels`, `registry_repo`, or `reference_integration_repo`.
-Use an empty grouping list or an empty repository string to disable the
-corresponding setting for that organization.
+An omitted or empty `repo_include_patterns` includes all active repositories of
+the organization. Tracked dependencies and workflow signals are configured per
+organization as well, so each organization's sections show only its own
+columns; list a shared workflow or dependency in every organization that uses
+it. Platform documentation sources in `[signals]` apply to all organizations.
 
-Collection can start tools inside repository checkouts. Currently this is the
-Bazel lockfile check. Such tools execute code from the repository and inherit
-the collector's environment, so that code could read and leak the GitHub
-token. `run_repository_tools` controls this per organization. It defaults to
-`true` for the primary organization and to `false` for additional
-organizations, whose lockfile status is then shown as `skipped`, or as
-`missing` when there is no lockfile:
-
-```toml
-# Only for organizations whose default branches are trusted with the token.
-run_repository_tools = false
-
-[organizations.example-tools]
-run_repository_tools = true
-```
+`run_repository_tools` is required. It decides whether collection may start
+tools inside repository checkouts. Such tools execute code from the repository
+and inherit the collector's environment, so that code could read and leak the
+GitHub token. Set it to `true` only for organizations whose default branches
+are trusted with that token. Collection currently starts no such tools, so the
+setting has no effect yet.
 
 The dashboard lists each organization's groups together in the combined view.
-Use the **Organization** selector to scope repository lists and the overview
-summary to one organization. The selected organization can be bookmarked with
+The **Organization** filter in the filter bar scopes repository lists and the
+overview summary to one organization. The selected organization can be bookmarked with
 the tab and other filters.
 
-The snapshot and cache distinguish repositories by `owner/repo`. Primary
-organization detail URLs keep their existing `<repo>/index.html` format.
-Additional organizations use `@orgs/<owner>/<repo>/index.html`.
+The first table is the primary organization. The snapshot and cache
+distinguish repositories by `owner/repo`. Primary organization detail URLs use
+the `<repo>/index.html` format. Additional organizations use
+`@orgs/<owner>/<repo>/index.html`.
 
 Policy report entries with short repository names use the primary organization
 by default. Set `repository_owner` in `[policy_report]` when those names refer
@@ -119,15 +115,17 @@ entire report.
 
 ### Tracked Workflows
 
-Configure one `[[signals.workflow_signals]]` entry per reusable workflow:
+Configure one `[[organizations.<name>.workflow_signals]]` entry per reusable
+workflow:
 
 ```toml
-[[signals.workflow_signals]]
+[[organizations.example-platform.workflow_signals]]
 label = "Daily"
 reference = "eclipse-score/cicd-workflows/.github/workflows/daily.yml@"
 ```
 
 The **Workflows** tab appears only when at least one workflow is configured.
+It shows sections only for organizations with configured workflows.
 Each column shows the distinct tags, branches, or commit pins used by a repository,
 linked to the reusable workflow source. Full commit hashes are shortened for display;
 the full reference remains available on hover. Multiple pins are shown together,
@@ -208,7 +206,8 @@ it points to the root of a configured GitHub registry's cached default branch.
 Other registry URLs leave the source unknown.
 
 The **Used by** section lists collected repositories that declare a direct
-dependency, along with their declared pins.
+dependency, along with their declared pins, grouped by their top-level
+category.
 Freshness and consumers are only known for repositories in the overview;
 external modules such as `rules_python` show their version only, and pins
 without a matching commit, tag, or branch are marked as unresolved.

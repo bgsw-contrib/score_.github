@@ -3,7 +3,6 @@ from dataclasses import replace
 
 from generate_repo_overview.collector.bazel_modules import parse_dependencies
 from generate_repo_overview.metrics_html import render_all_pages
-from generate_repo_overview.metrics_report import render_versions_section
 from generate_repo_overview.models import (
     SNAPSHOT_SCHEMA_VERSION,
     DeepContentSignals,
@@ -11,6 +10,7 @@ from generate_repo_overview.models import (
     DependencyOverride,
     DependencyPinKind,
     DependencyResolution,
+    OrganizationSignals,
     RepoEntry,
     RepoSnapshot,
     TrackedDep,
@@ -189,6 +189,43 @@ def test_detail_page_lists_consumers_with_the_versions_they_use() -> None:
     assert "Declared direct dependencies only." in used_by
 
 
+def test_detail_page_groups_consumers_by_category() -> None:
+    snapshot = _snapshot()
+    base, current, pinned = snapshot.repos
+    snapshot = replace(
+        snapshot, repos=(base, replace(pinned, category="Applications"), current)
+    )
+    page = render_all_pages(snapshot)["baselibs/index.html"]
+    used_by = page[
+        page.index('id="used-by"') : page.index(
+            "</section>", page.index('id="used-by"')
+        )
+    ]
+
+    headers = re.findall(r'<tr class="group-header"><td colspan="3">(.*?) <', used_by)
+    assert headers == ["Applications", "Platform"]
+    applications, platform = used_by.split('<tr class="group-header">')[1:]
+    assert "eclipse-score/pinned" in applications
+    assert "(1)" in applications
+    assert "eclipse-score/current" in platform
+    assert "eclipse-score/pinned" not in platform
+
+
+def test_detail_page_groups_consumers_of_further_organizations_last() -> None:
+    snapshot = _snapshot()
+    base, current, pinned = snapshot.repos
+    snapshot = replace(
+        snapshot,
+        additional_org_names=("a-org",),
+        repos=(base, replace(pinned, owner="a-org"), current),
+    )
+    page = render_all_pages(snapshot)["baselibs/index.html"]
+    used_by = page[page.index('id="used-by"') :]
+
+    headers = re.findall(r'<tr class="group-header"><td colspan="3">(.*?) <', used_by)
+    assert headers == ["eclipse-score / Platform", "a-org / Platform"]
+
+
 def test_tracked_git_pin_label_stays_neutral_in_version_summaries() -> None:
     snapshot = _snapshot()
     base, _, pinned = snapshot.repos
@@ -204,13 +241,15 @@ def test_tracked_git_pin_label_stays_neutral_in_version_summaries() -> None:
     snapshot = replace(
         snapshot,
         repos=(base, consumer),
-        tracked_deps=(TrackedDep(BASELIBS, "score_baselibs"),),
+        organization_signals={
+            snapshot.org_name.casefold(): OrganizationSignals(
+                tracked_deps=(TrackedDep(BASELIBS, "score_baselibs"),)
+            )
+        },
     )
     pages = render_all_pages(snapshot)
     assert '<span class="badge muted">1.1.0</span>' in pages["pinned/index.html"]
     assert pages["index.html"].count('<span class="badge muted">1.1.0</span>') == 2
-    markdown = render_versions_section(list(snapshot.repos), snapshot=snapshot)
-    assert any("⚪ 1.1.0" in line for line in markdown)
 
 
 def test_detail_page_marks_changed_archive_and_local_path_overrides() -> None:

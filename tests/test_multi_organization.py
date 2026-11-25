@@ -1,6 +1,8 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import github
 import pytest
@@ -8,15 +10,17 @@ import pytest
 import generate_repo_overview.cli as cli
 import generate_repo_overview.collector as collector
 from generate_repo_overview.metrics_html import render_all_pages
-from generate_repo_overview.metrics_report import render_metrics_report
 from generate_repo_overview.models import (
     SNAPSHOT_SCHEMA_VERSION,
     DeepContentSignals,
+    OrganizationSignals,
     RepoEntry,
     RepoSnapshot,
+    TrackedDep,
     VolatileMetricsSnapshot,
+    WorkflowSignal,
 )
-from generate_repo_overview.org_config import load_org_config
+from generate_repo_overview.org_config import OrgConfig, load_org_config
 from generate_repo_overview.profile_readme import render_repo_row
 
 
@@ -26,12 +30,13 @@ def test_same_repo_name_has_separate_cache_entries_and_detail_pages(
     config_path = tmp_path / "org.toml"
     config_path.write_text(
         """
-org_name = "first-org"
+[organizations.first-org]
+run_repository_tools = false
 repo_include_patterns = ["shared", "primary-*"]
 
 [organizations.second-org]
+run_repository_tools = false
 repo_include_patterns = ["shared", "secondary-*"]
-reference_integration_repo = ""
 """,
         encoding="utf-8",
     )
@@ -103,13 +108,18 @@ reference_integration_repo = ""
         ("first-org/shared", "Primary repo"),
         ("second-org/shared", "Secondary repo"),
     ]
-    # Disabling the integration clears the pin even when the repo content is reused.
+    # Without a reference integration, the pin is cleared even when the repo
+    # content is reused.
     assert snapshot.repos[1].content == DeepContentSignals(is_bazel_repo=True)
-    assert config.collection_configs()[0].repo_matches_filter("primary-tool")
-    assert not config.collection_configs()[1].repo_matches_filter("primary-tool")
-    assert config.collection_configs()[1].repo_matches_filter("secondary-tool")
+    assert config.organizations[0].repo_matches_filter("primary-tool")
+    assert not config.organizations[1].repo_matches_filter("primary-tool")
+    assert config.organizations[1].repo_matches_filter("secondary-tool")
 
     pages = render_all_pages(snapshot)
+    filter_bar = (
+        pages["index.html"].split('<div id="filters">', 1)[1].split("</div>")[0]
+    )
+    assert 'id="organization-filter"' in filter_bar
     assert '<option value="">All organizations (2)</option>' in pages["index.html"]
     assert '<option value="first-org">first-org (1)</option>' in pages["index.html"]
     assert '<option value="second-org">second-org (1)</option>' in pages["index.html"]
@@ -191,8 +201,10 @@ def test_render_details_reserves_secondary_org_namespace(
     collector.write_snapshot(snapshot, Path("snapshot.json"))
     Path("org.toml").write_text(
         """
-org_name = "first-org"
+[organizations.first-org]
+run_repository_tools = false
 [organizations.second-org]
+run_repository_tools = false
 
 [policy_report]
 source_repo = "first-org/report-generator"
@@ -265,7 +277,7 @@ repository_owner = "second-org"
     assert "policy-status changes-required" in policy_rows[0]
 
 
-@pytest.mark.parametrize("schema_version", [30, 31, 32, 33, 34])
+@pytest.mark.parametrize("schema_version", [30, 31, 32, 33, 34, 35])
 def test_older_snapshot_renders_but_is_not_reused_for_collection(
     schema_version: int, tmp_path: Path
 ) -> None:
@@ -308,35 +320,118 @@ def test_older_snapshot_renders_but_is_not_reused_for_collection(
     assert collector.load_snapshot_if_present(cache) is None
 
 
-def test_markdown_qualifies_secondary_repository_names_in_each_table() -> None:
+def test_profile_readme_qualifies_secondary_repository_names() -> None:
     primary = RepoEntry("tools", "", "Tools", "General", owner="first-org")
     secondary = RepoEntry("tools", "", "Tools", "General", owner="second-org")
-    snapshot = RepoSnapshot(
-        schema_version=SNAPSHOT_SCHEMA_VERSION,
-        org_name="first-org",
-        generated_at="2026-01-01T00:00:00+00:00",
-        repos=(primary, secondary),
-        additional_org_names=("second-org",),
+    assert "[tools](https://github.com/first-org/tools)" in render_repo_row(
+        primary, "first-org"
     )
-    primary_link = "[tools](https://github.com/first-org/tools)"
-    secondary_link = "[second-org/tools](https://github.com/second-org/tools)"
-    markdown = render_metrics_report(snapshot)
-    assert markdown.count(primary_link) == 3
-    assert markdown.count(secondary_link) == 3
-    assert secondary_link in render_repo_row(secondary, "first-org")
+    assert "[second-org/tools](https://github.com/second-org/tools)" in (
+        render_repo_row(secondary, "first-org")
+    )
 
 
 def test_markdown_rejects_an_invalid_owner_instead_of_interpreting_it_as_markup() -> (
     None
 ):
     entry = RepoEntry("tools", "", "Tools", "General", owner="invalid]owner")
-    snapshot = RepoSnapshot(
-        schema_version=SNAPSHOT_SCHEMA_VERSION,
-        org_name="first-org",
-        generated_at="2026-01-01T00:00:00+00:00",
-        repos=(entry,),
-    )
     with pytest.raises(ValueError, match="Invalid repository name in snapshot"):
         render_repo_row(entry, "first-org")
-    with pytest.raises(ValueError, match="Invalid repository name in snapshot"):
-        render_metrics_report(snapshot)
+
+
+def _two_org_snapshot() -> RepoSnapshot:
+    first_ci = WorkflowSignal("First CI", "first-org/cicd/.github/workflows/ci.yml@")
+    second_ci = WorkflowSignal("Second CI", "second-org/cicd/.github/workflows/ci.yml@")
+    return RepoSnapshot(
+        schema_version=SNAPSHOT_SCHEMA_VERSION,
+        org_name="first-org",
+        additional_org_names=("second-org",),
+        generated_at="2026-01-01T00:00:00+00:00",
+        repos=(
+            RepoEntry("app", "", "Apps", "General", owner="first-org"),
+            RepoEntry("lib", "", "Libraries", "General", owner="second-org"),
+        ),
+        organization_signals={
+            "first-org": OrganizationSignals(
+                tracked_deps=(TrackedDep("first-org/first-docs", "first_docs"),),
+                workflow_signals=(first_ci,),
+            ),
+            "second-org": OrganizationSignals(workflow_signals=(second_ci,)),
+        },
+    )
+
+
+def test_each_organization_shows_only_its_own_signals() -> None:
+    snapshot = RepoSnapshot.from_dict(_two_org_snapshot().to_dict())
+    pages = render_all_pages(snapshot)
+    index = pages["index.html"]
+
+    def section(tab: str, category: str) -> str:
+        marker = f'data-tab="{tab}" data-category="{category}"'
+        return index.split(marker, 1)[1].split('<div class="section hidden"', 1)[0]
+
+    assert "First CI" in section("workflows", "first-org / Apps")
+    assert "Second CI" not in section("workflows", "first-org / Apps")
+    assert "Second CI" in section("workflows", "second-org / Libraries")
+    assert "First CI" not in section("workflows", "second-org / Libraries")
+    assert "First Docs Version" in section("versions", "first-org / Apps")
+    assert "First Docs Version" not in section("versions", "second-org / Libraries")
+    second_detail = pages["@orgs/second-org/lib/index.html"]
+    assert "Second CI" in second_detail
+    assert "First CI" not in second_detail
+    assert "First Docs" not in second_detail
+
+
+def test_older_snapshot_applies_its_signals_to_every_organization() -> None:
+    data = _two_org_snapshot().to_dict()
+    del data["organization_signals"]
+    signal = {"label": "Shared CI", "reference": "org/cicd/ci.yml@"}
+    data.update(schema_version=35, workflow_signals=[signal], tracked_deps=[])
+
+    snapshot = RepoSnapshot.from_dict(data)
+
+    shared = (WorkflowSignal("Shared CI", "org/cicd/ci.yml@"),)
+    assert snapshot.signals_for("first-org").workflow_signals == shared
+    assert snapshot.signals_for("Second-Org").workflow_signals == shared
+
+
+def test_changed_signals_of_another_organization_keep_the_content_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _two_org_snapshot()
+    cached_entries: list[RepoEntry | None] = []
+
+    def collect(**kwargs: Any) -> RepoEntry:
+        cached_entries.append(kwargs["cached_entry"])
+        return RepoEntry("lib", "", "Libraries", "General")
+
+    monkeypatch.setattr(
+        collector,
+        "fetch_active_repositories",
+        lambda organization, **_kwargs: {
+            "lib": collector.ActiveRepositoryData(
+                repository=SimpleNamespace(archived=False, name="lib"),
+                custom_properties={},
+            )
+        },
+    )
+    monkeypatch.setattr(collector.repo_entry, "collect_repository_entry", collect)
+    second_org = OrgConfig(
+        "second-org",
+        workflow_signals=snapshot.signals_for("second-org").workflow_signals,
+    )
+    changed_snapshot = replace(
+        snapshot,
+        organization_signals={
+            **snapshot.organization_signals,
+            "first-org": OrganizationSignals(),
+        },
+    )
+
+    collector.fetch_repositories(
+        cast("Any", SimpleNamespace(login="second-org")),
+        existing_snapshot=changed_snapshot,
+        config=second_org,
+    )
+
+    assert cached_entries == [snapshot.repos[1]]

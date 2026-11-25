@@ -7,21 +7,10 @@ from enum import StrEnum
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-
-class LockfileStatus(StrEnum):
-    OK = "ok"
-    MISSING = "missing"
-    ERROR = "error"
-    TIMEOUT = "timeout"
-    # The organization does not run repository tools, so nothing was checked.
-    SKIPPED = "skipped"
-    UNKNOWN = "unknown"
-
-
 DEFAULT_CATEGORY = "Uncategorized"
 DEFAULT_SUBCATEGORY = "General"
-SNAPSHOT_SCHEMA_VERSION = 35
-_LEGACY_SNAPSHOT_SCHEMA_VERSIONS = (30, 31, 32, 33, 34)
+SNAPSHOT_SCHEMA_VERSION = 36
+_LEGACY_SNAPSHOT_SCHEMA_VERSIONS = (30, 31, 32, 33, 34, 35)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +55,43 @@ class WorkflowSignal:
 
     def to_dict(self) -> dict[str, str]:
         return {"label": self.label, "reference": self.reference}
+
+
+@dataclass(frozen=True, slots=True)
+class OrganizationSignals:
+    """The tracked dependencies and workflow signals of one organization."""
+
+    tracked_deps: tuple[TrackedDep, ...] = ()
+    workflow_signals: tuple[WorkflowSignal, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OrganizationSignals:
+        return cls(
+            tracked_deps=tuple(
+                TrackedDep.from_dict(cast("Mapping[str, Any]", item))
+                for item in (data.get("tracked_deps") or ())
+                if isinstance(item, dict)
+                and isinstance(item.get("repo"), str)
+                and item["repo"]
+                and isinstance(item.get("module_name"), str)
+                and item["module_name"]
+            ),
+            workflow_signals=tuple(
+                WorkflowSignal.from_dict(cast("Mapping[str, Any]", item))
+                for item in (data.get("workflow_signals") or ())
+                if isinstance(item, dict)
+                and isinstance(item.get("label"), str)
+                and item["label"]
+                and isinstance(item.get("reference"), str)
+                and item["reference"]
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tracked_deps": [dep.to_dict() for dep in self.tracked_deps],
+            "workflow_signals": [s.to_dict() for s in self.workflow_signals],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,8 +294,7 @@ class DeepContentSignals:
     has_coverage_config: bool = False
     top_languages: tuple[str, ...] = ()
     bazel_deps: tuple[DependencyDeclaration, ...] = ()
-    bazel_lockfile_status: LockfileStatus = LockfileStatus.UNKNOWN
-    bazel_lockfile_error_output: str | None = None
+    has_bazel_lockfile: bool = False
     sphinx_features: tuple[SphinxItem, ...] = ()
     sphinx_modules: tuple[SphinxItem, ...] = ()
     docs_feature_paths: tuple[str, ...] = ()
@@ -335,12 +360,7 @@ class DeepContentSignals:
             has_coverage_config=bool(data.get("has_coverage_config", False)),
             top_languages=normalize_string_tuple(data.get("top_languages")),
             bazel_deps=_parse_dependencies(data.get("bazel_deps")),
-            bazel_lockfile_status=_parse_lockfile_status(
-                data.get("bazel_lockfile_status")
-            ),
-            bazel_lockfile_error_output=cast(
-                "str | None", data.get("bazel_lockfile_error_output")
-            ),
+            has_bazel_lockfile=_parse_has_bazel_lockfile(data),
             sphinx_features=_parse_sphinx_items(data.get("sphinx_features")),
             sphinx_modules=_parse_sphinx_items(data.get("sphinx_modules")),
             docs_feature_paths=normalize_string_tuple(data.get("docs_feature_paths")),
@@ -566,8 +586,10 @@ class RepoSnapshot:
     org_name: str
     generated_at: str
     repos: tuple[RepoEntry, ...]
-    tracked_deps: tuple[TrackedDep, ...] = ()
-    workflow_signals: tuple[WorkflowSignal, ...] = ()
+    # Keyed by the case-folded organization name.
+    organization_signals: Mapping[str, OrganizationSignals] = field(
+        default_factory=dict[str, OrganizationSignals]
+    )
     workflow_ref_resolutions: tuple[WorkflowRefResolution, ...] = ()
     additional_org_names: tuple[str, ...] = ()
     module_repositories: Mapping[str, Mapping[str, str]] = field(
@@ -601,6 +623,12 @@ class RepoSnapshot:
     @property
     def organization_names(self) -> tuple[str, ...]:
         return (self.org_name, *self.additional_org_names)
+
+    def signals_for(self, owner: str) -> OrganizationSignals:
+        """Return the signals of *owner*, the primary organization when empty."""
+        return self.organization_signals.get(
+            (owner or self.org_name).casefold(), OrganizationSignals()
+        )
 
     def dependency_repository(
         self, consumer: RepoEntry, declaration: DependencyDeclaration
@@ -670,24 +698,17 @@ class RepoSnapshot:
             and data.get("dependency_sources_available", True) is True
         )
 
-        tracked_deps = tuple(
-            TrackedDep.from_dict(cast("Mapping[str, Any]", item))
-            for item in (data.get("tracked_deps") or ())
-            if isinstance(item, dict)
-            and isinstance(item.get("repo"), str)
-            and item["repo"]
-            and isinstance(item.get("module_name"), str)
-            and item["module_name"]
-        )
-        workflow_signals = tuple(
-            WorkflowSignal.from_dict(cast("Mapping[str, Any]", item))
-            for item in (data.get("workflow_signals") or ())
-            if isinstance(item, dict)
-            and isinstance(item.get("label"), str)
-            and item["label"]
-            and isinstance(item.get("reference"), str)
-            and item["reference"]
-        )
+        additional_org_names = normalize_string_tuple(data.get("additional_org_names"))
+        if schema_version == SNAPSHOT_SCHEMA_VERSION:
+            organization_signals = _parse_organization_signals(
+                data.get("organization_signals")
+            )
+        else:
+            # Older snapshots applied the same signals to every organization.
+            shared = OrganizationSignals.from_dict(data)
+            organization_signals = {
+                org.casefold(): shared for org in (org_name, *additional_org_names)
+            }
 
         return cls(
             schema_version=SNAPSHOT_SCHEMA_VERSION,
@@ -699,11 +720,8 @@ class RepoSnapshot:
                 )
                 for repo in typed_repos_data
             ),
-            additional_org_names=normalize_string_tuple(
-                data.get("additional_org_names")
-            ),
-            tracked_deps=tracked_deps,
-            workflow_signals=workflow_signals,
+            additional_org_names=additional_org_names,
+            organization_signals=organization_signals,
             workflow_ref_resolutions=tuple(
                 WorkflowRefResolution.from_dict(cast("Mapping[str, Any]", item))
                 for item in (data.get("workflow_ref_resolutions") or ())
@@ -734,8 +752,10 @@ class RepoSnapshot:
             "additional_org_names": list(self.additional_org_names),
             "generated_at": self.generated_at,
             "repos": [repo.to_dict() for repo in self.repos],
-            "tracked_deps": [dep.to_dict() for dep in self.tracked_deps],
-            "workflow_signals": [s.to_dict() for s in self.workflow_signals],
+            "organization_signals": {
+                org: signals.to_dict()
+                for org, signals in self.organization_signals.items()
+            },
             "workflow_ref_resolutions": [
                 asdict(r) for r in self.workflow_ref_resolutions
             ],
@@ -751,13 +771,12 @@ class RepoSnapshot:
 CustomPropertyValue = str | list[str] | None
 
 
-def _parse_lockfile_status(value: object) -> LockfileStatus:
-    if isinstance(value, str):
-        try:
-            return LockfileStatus(value)
-        except ValueError:
-            pass
-    return LockfileStatus.UNKNOWN
+def _parse_has_bazel_lockfile(data: Mapping[str, object]) -> bool:
+    if "has_bazel_lockfile" in data:
+        return bool(data["has_bazel_lockfile"])
+    # Snapshots before schema 36 recorded a Bazel lockfile check; every status
+    # except these two implies that the lockfile exists.
+    return data.get("bazel_lockfile_status", "unknown") not in ("missing", "unknown")
 
 
 def normalize_string_pairs(value: object) -> tuple[tuple[str, str], ...]:
@@ -810,6 +829,18 @@ def _parse_dependencies(value: object) -> tuple[DependencyDeclaration, ...]:
         for module, version in normalize_string_pairs(items)
     )
     return declarations + legacy
+
+
+def _parse_organization_signals(value: object) -> dict[str, OrganizationSignals]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(org).casefold(): OrganizationSignals.from_dict(
+            cast("Mapping[str, Any]", signals)
+        )
+        for org, signals in cast("dict[object, object]", value).items()
+        if isinstance(signals, dict)
+    }
 
 
 def _parse_module_repositories(value: object) -> dict[str, Mapping[str, str]]:

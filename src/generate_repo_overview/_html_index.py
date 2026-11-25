@@ -25,7 +25,6 @@ from .metrics_report import (
     tracked_dep_label,
 )
 from .models import (
-    LockfileStatus,
     is_tracked_dep_repo,
     lookup_bazel_dependency,
 )
@@ -108,8 +107,13 @@ def render_index_page(
         f"  <style>{CSS}</style>\n"
         "</head>\n<body>\n"
         + _render_header(snapshot, repos, repos_by_org)
-        + _render_tab_bar(show_workflows=bool(snapshot.workflow_signals))
-        + _render_filters_placeholder()
+        + _render_tab_bar(
+            show_workflows=any(
+                signals.workflow_signals
+                for signals in snapshot.organization_signals.values()
+            )
+        )
+        + _render_filters(snapshot, repos, repos_by_org)
         + _render_version_view_toggle()
         + '<div id="sections">\n'
         + _render_overview_sections(categories, snapshot.org_name)
@@ -141,30 +145,15 @@ def _render_header(
     repos: list[RepoEntry],
     repos_by_org: dict[str, list[RepoEntry]],
 ) -> str:
-    organization_filter = ""
     organization_summaries = ""
     if snapshot.additional_org_names:
-        options = "".join(
-            f'<option value="{e(org)}">{e(org)} ({len(entries)})</option>'
-            for org, entries in repos_by_org.items()
-        )
-        organization_filter = (
-            '<label class="filter-select" for="organization-filter">'
-            'Organization <select id="organization-filter" '
-            f'data-primary-org="{e(snapshot.org_name)}">'
-            f'<option value="">All organizations ({len(repos)})</option>{options}'
-            "</select></label>"
-        )
         organization_summaries = "".join(
             _render_header_summary(entries, org=org)
             for org, entries in repos_by_org.items()
         )
     return (
         "<header>\n"
-        '  <div class="dashboard-heading">\n'
-        "    <h1>Cross-Repo Metrics Report</h1>\n"
-        f"    {organization_filter}\n"
-        "  </div>\n"
+        "  <h1>Cross-Repo Metrics Report</h1>\n"
         f'  <p class="subtitle">Generated {e(snapshot.generated_at)}</p>\n'
         + _render_header_summary(repos)
         + organization_summaries
@@ -233,8 +222,26 @@ def _render_tab_bar(*, show_workflows: bool = False) -> str:
     )
 
 
-def _render_filters_placeholder() -> str:
-    return '<div id="filters"></div>\n\n'
+def _render_filters(
+    snapshot: RepoSnapshot,
+    repos: list[RepoEntry],
+    repos_by_org: dict[str, list[RepoEntry]],
+) -> str:
+    """Render the filter bar; the script adds the remaining filters."""
+    if not snapshot.additional_org_names:
+        return '<div id="filters"></div>\n\n'
+    options = "".join(
+        f'<option value="{e(org)}">{e(org)} ({len(entries)})</option>'
+        for org, entries in repos_by_org.items()
+    )
+    return (
+        '<div id="filters">'
+        '<label class="filter-select" for="organization-filter">'
+        '<span>Organization</span><select id="organization-filter" '
+        f'aria-label="Organization" data-primary-org="{e(snapshot.org_name)}">'
+        f'<option value="">All organizations ({len(repos)})</option>{options}'
+        "</select></label></div>\n\n"
+    )
 
 
 def _render_version_view_toggle() -> str:
@@ -571,9 +578,10 @@ def _render_versions_sections(
 ) -> str:
     repos = sorted(snapshot.repos, key=lambda r: r.name.casefold())
     max_bazel = get_max_bazel_version(repos)
-    tracked_deps = snapshot.tracked_deps
     parts: list[str] = []
     for category, cat_repos in categories:
+        # Each section belongs to one organization and shows its tracked deps.
+        tracked_deps = snapshot.signals_for(cat_repos[0].owner).tracked_deps
         rows = "\n".join(_versions_row(r, snapshot, max_bazel) for r in cat_repos)
         cards = "\n".join(_versions_card(r, snapshot, max_bazel) for r in cat_repos)
         dep_headers = "".join(
@@ -611,7 +619,7 @@ def _versions_card(
     max_bazel: tuple[int, ...] | None,
 ) -> str:
     org_name = snapshot.org_name
-    tracked_deps = snapshot.tracked_deps
+    tracked_deps = snapshot.signals_for(entry.owner).tracked_deps
     bazel_cell = bazel_version_badge(entry.content.bazel_version, max_bazel)
     if (
         entry.volatile.release_bazel_version
@@ -758,7 +766,7 @@ def _versions_row(
     max_bazel: tuple[int, ...] | None,
 ) -> str:
     org_name = snapshot.org_name
-    tracked_deps = snapshot.tracked_deps
+    tracked_deps = snapshot.signals_for(entry.owner).tracked_deps
     name_cell = repo_name_cell(entry, org_name)
     filter_attrs = _repo_filter_attributes(entry)
 
@@ -811,20 +819,22 @@ def _render_workflow_sections(
     categories: list[tuple[str, list[RepoEntry]]],
     snapshot: RepoSnapshot,
 ) -> str:
-    if not snapshot.workflow_signals:
-        return ""
-    headers = "".join(
-        f'<th data-sort="workflow-{index}" title="Workflow pins resolved to version tags where available. Arrows compare the pin with the latest release of the workflow repository: ↑ ahead, ↓ behind.">'
-        f'{e(signal.label)} <span class="sort-arrow"></span></th>'
-        for index, signal in enumerate(snapshot.workflow_signals)
-    )
     parts: list[str] = []
     for category, repos in categories:
+        # Each section belongs to one organization and shows its workflows.
+        workflow_signals = snapshot.signals_for(repos[0].owner).workflow_signals
+        if not workflow_signals:
+            continue
+        headers = "".join(
+            f'<th data-sort="workflow-{index}" title="Workflow pins resolved to version tags where available. Arrows compare the pin with the latest release of the workflow repository: ↑ ahead, ↓ behind.">'
+            f'{e(signal.label)} <span class="sort-arrow"></span></th>'
+            for index, signal in enumerate(workflow_signals)
+        )
         rows: list[str] = []
         for entry in repos:
             cells = "".join(
                 f"<td>{workflow_ref_badges(entry, signal.label, snapshot.workflow_ref_resolutions)}</td>"
-                for signal in snapshot.workflow_signals
+                for signal in workflow_signals
             )
             rows.append(
                 f"<tr{_repo_filter_attributes(entry)}>"
@@ -860,7 +870,7 @@ def _render_automation_sections(
             f'      <th data-sort="name">Repository <span class="sort-arrow"></span></th>\n'
             f'      <th data-sort="lang">Language <span class="sort-arrow"></span></th>\n'
             f'      <th data-sort="bazel" class="text-center" title="Whether this repository uses Bazel as its build system.">Bazel <span class="sort-arrow"></span></th>\n'
-            f'      <th data-sort="lockfile" class="text-center" title="Whether `bazel mod deps --lockfile_mode=error` passes — the Bazel lockfile is up to date.">Lockfile <span class="sort-arrow"></span></th>\n'
+            f'      <th data-sort="lockfile" class="text-center" title="Whether this Bazel module commits its MODULE.bazel.lock. Whether the lockfile is up to date is not checked.">Lockfile <span class="sort-arrow"></span></th>\n'
             f'      <th data-sort="gitlint" class="text-center" title="Whether this repository enforces commit message formatting rules (gitlint).">Gitlint <span class="sort-arrow"></span></th>\n'
             f'      <th data-sort="pyproject" class="text-center" title="Whether this repository has a pyproject.toml — the standard configuration file for Python projects.">Pyproject <span class="sort-arrow"></span></th>\n'
             f'      <th data-sort="precommit" class="text-center" title="Whether this repository runs automated checks (formatting, linting, etc.) before each commit is accepted.">Pre-commit <span class="sort-arrow"></span></th>\n'
@@ -874,44 +884,18 @@ def _render_automation_sections(
     return "".join(parts)
 
 
-def _lockfile_cell(entry: RepoEntry, org_name: str) -> tuple[str, str]:
-    status = entry.content.bazel_lockfile_status
-    has_error = bool(entry.content.bazel_lockfile_error_output)
-    url = f"{e(entry.detail_path(org_name))}#lockfile-error"
-
-    if status == LockfileStatus.OK:
+def _lockfile_cell(entry: RepoEntry) -> tuple[str, str]:
+    if not entry.content.has_bazel_module:
+        return '<span class="text-muted">—</span>', "Not a Bazel module repository."
+    if entry.content.has_bazel_lockfile:
         return (
-            '<span class="badge green">ok</span>',
-            "The Bazel lockfile is up to date.",
+            '<span class="badge green">yes</span>',
+            "MODULE.bazel.lock is committed.",
         )
-    if status == LockfileStatus.MISSING:
-        cell = f'<span class="badge yellow"><a href="{url}" class="lockfile-error-link">missing</a></span>'
-        return cell, "MODULE.bazel.lock does not exist — click for details."
-    if status == LockfileStatus.ERROR:
-        link_text = (
-            f'<a href="{url}" class="lockfile-error-link">error</a>'
-            if has_error
-            else "error"
-        )
-        return (
-            f'<span class="badge red">{link_text}</span>',
-            "The Bazel lockfile is out of date — click to see the error.",
-        )
-    if status == LockfileStatus.TIMEOUT:
-        cell = f'<span class="badge yellow"><a href="{url}" class="lockfile-error-link">timeout</a></span>'
-        return cell, "Bazel lockfile check timed out — click for details."
-    if status == LockfileStatus.SKIPPED:
-        return (
-            '<span class="text-muted">skipped</span>',
-            "Repository tools are disabled for this organization, "
-            "so Bazel did not check the lockfile.",
-        )
-    if entry.content.has_bazel_module:
-        return (
-            '<span class="text-muted">n/a</span>',
-            "Lockfile status not yet collected.",
-        )
-    return '<span class="text-muted">—</span>', "Not a Bazel module repository."
+    return (
+        '<span class="badge yellow">missing</span>',
+        "MODULE.bazel.lock does not exist. Run bazel mod deps to generate it.",
+    )
 
 
 def _automation_row(entry: RepoEntry, org_name: str) -> str:
@@ -929,7 +913,7 @@ def _automation_row(entry: RepoEntry, org_name: str) -> str:
             return '<span class="badge green">yes</span>'
         return '<span class="text-muted">no</span>'
 
-    lockfile_cell, lockfile_tip = _lockfile_cell(entry, org_name)
+    lockfile_cell, lockfile_tip = _lockfile_cell(entry)
 
     tips = {
         "bazel": "This repository uses Bazel as its build system."
@@ -1289,7 +1273,8 @@ def _render_traceability_section(
         if snapshot.additional_org_names
         else "Requirement Traceability"
     )
-    dep_repos = [r for r in repos if is_tracked_dep_repo(r, snapshot.tracked_deps)]
+    tracked_deps = snapshot.signals_for(owner).tracked_deps
+    dep_repos = [r for r in repos if is_tracked_dep_repo(r, tracked_deps)]
     if not dep_repos:
         return ""
 
